@@ -182,6 +182,8 @@ Volume-level:
 - `OpenWithOptions(reader io.ReaderAt, options OpenOptions) (*Volume, error)`
 - `(*Volume).GetRootDirectory() (*File, error)`
 - `(*Volume).OpenPath(path string) (*File, error)`
+- `(*Volume).OpenEntry(entry DirEntry) (*File, error)` — the route to deleted
+  and orphaned entries, which no path resolves to
 - `(*Volume).GetBootSector() *BootSector`
 
 Fragments and offsets:

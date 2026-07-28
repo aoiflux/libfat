@@ -111,6 +111,31 @@ func (v *Volume) OpenPath(filePath string) (*File, error) {
 	return current, nil
 }
 
+// OpenEntry returns a File for a directory entry obtained from ReadDir or
+// ScanOrphans.
+//
+// OpenPath deliberately refuses deleted and orphaned entries: no live path
+// leads to them, so there is nothing to resolve. This is how their content is
+// read instead. Enumerate the entries, then open the one you want:
+//
+//	f, err := v.OpenEntry(entry)
+//	f.SetFragmentOptions(libfat.FragmentOptions{AssumeContiguous: true})
+//	data, err := f.ReadAll()
+//
+// For a deleted entry the default options locate only the first cluster and
+// ReadAll reports ErrTruncatedChain alongside the recovered prefix; see
+// FragmentOptions for the reconstruction alternative.
+func (v *Volume) OpenEntry(entry DirEntry) (*File, error) {
+	if v.IsClosed() {
+		return nil, ErrVolumeClosed
+	}
+	if entry.Virtual {
+		return nil, fmt.Errorf("%w: %s is a virtual entry with no backing data",
+			ErrFileNotFound, entry.Name)
+	}
+	return v.openDirEntry(entry), nil
+}
+
 func (v *Volume) openDirEntry(entry DirEntry) *File {
 	return &File{
 		volume:       v,

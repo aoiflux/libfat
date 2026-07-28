@@ -53,6 +53,10 @@ because they alter what existing callers observe at runtime.
   `MinValidEntries`, `MaxClusters`, `MaxDirectories`, `MaxDepth`. The zero value
   is the precision-first configuration. Adds `DirEntry.Orphaned` and the
   `OrphanPath` constant.
+- `Volume.OpenEntry(DirEntry) (*File, error)` opens an entry obtained from
+  `ReadDir` or `ScanOrphans`. `OpenPath` refuses deleted and orphaned entries
+  because no live path leads to them, which previously left no public way to
+  read their content through the `File` API.
 - Sentinel errors `ErrTruncatedChain`, `ErrFragmented`, `ErrNoDataClusters`.
 - Test image builder placing files at explicitly chosen clusters, a
   fragmentation matrix across FAT12/16/32, adversarial corpus (cluster loops,

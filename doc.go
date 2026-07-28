@@ -57,6 +57,13 @@
 // Check FragmentResult.FirstClusterReallocated before trusting recovered data:
 // when it is set, the content has most likely been overwritten.
 //
+// OpenPath refuses deleted entries, because no live path leads to one. Use
+// OpenEntry to read their content:
+//
+//	f, _ := v.OpenEntry(entry)
+//	f.SetFragmentOptions(libfat.FragmentOptions{AssumeContiguous: true})
+//	data, err := f.ReadAll()
+//
 // # Orphaned files
 //
 // Deleting a directory marks its entry in the parent and frees its FAT chain,
