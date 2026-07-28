@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"sync"
 	"sync/atomic"
 )
@@ -15,8 +16,8 @@ type Volume struct {
 	forcedFATType             string
 	includeVolumeLabelEntries bool
 	includeVirtualRootEntries bool
+	recoverDeletedLongNames   bool
 
-	mu      sync.RWMutex
 	closed  bool
 	closeMu sync.RWMutex
 
@@ -76,6 +77,7 @@ func OpenWithOptions(reader io.ReaderAt, options OpenOptions) (*Volume, error) {
 		forcedFATType:             fatType,
 		includeVolumeLabelEntries: options.IncludeVolumeLabelEntries,
 		includeVirtualRootEntries: options.IncludeVirtualRootEntries,
+		recoverDeletedLongNames:   options.RecoverDeletedLongNames,
 	}
 	if err := v.parseBootSector(); err != nil {
 		return nil, wrapVolumeError("open", err)
@@ -387,11 +389,19 @@ func (v *Volume) ClusterToOffset(cluster uint32) (int64, error) {
 	if v.IsClosed() {
 		return 0, ErrVolumeClosed
 	}
-	if cluster < defaultRootCluster {
+	return v.clusterToOffset(cluster)
+}
+
+func (v *Volume) clusterToOffset(cluster uint32) (int64, error) {
+	if cluster < defaultRootCluster || cluster > v.maxClusterNumber() {
 		return 0, fmt.Errorf("%w: invalid cluster %d", ErrCorruptStructure, cluster)
 	}
-	sector := v.firstDataSector + ((cluster - defaultRootCluster) * v.sectorsPerCluster)
-	return int64(sector) * int64(v.bytesPerSector), nil
+	sector := uint64(v.firstDataSector) + (uint64(cluster-defaultRootCluster) * uint64(v.sectorsPerCluster))
+	offset := sector * uint64(v.bytesPerSector)
+	if offset+uint64(v.bytesPerCluster) > v.volumeSize || offset > uint64(math.MaxInt64) {
+		return 0, fmt.Errorf("%w: cluster %d extends beyond volume", ErrCorruptStructure, cluster)
+	}
+	return int64(offset), nil
 }
 
 func (v *Volume) ReadAt(p []byte, offset int64) (int, error) {
@@ -415,7 +425,7 @@ func (v *Volume) readSectors(firstSector, sectorCount uint32) ([]byte, error) {
 }
 
 func (v *Volume) readCluster(cluster uint32) ([]byte, error) {
-	offset, err := v.ClusterToOffset(cluster)
+	offset, err := v.clusterToOffset(cluster)
 	if err != nil {
 		return nil, err
 	}

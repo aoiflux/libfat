@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -34,8 +35,12 @@ func main() {
 		log.Fatalf("%s is a directory", os.Args[2])
 	}
 
+	// A truncated chain still yields every byte that could be located, which is
+	// the useful outcome for a deleted file. Write the recovered prefix and say
+	// so, rather than discarding it.
 	data, err := target.ReadAll()
-	if err != nil {
+	truncated := errors.Is(err, libfat.ErrTruncatedChain)
+	if err != nil && !truncated {
 		log.Fatalf("Failed to read %s: %v", os.Args[2], err)
 	}
 
@@ -43,5 +48,10 @@ func main() {
 		log.Fatalf("Failed to write %s: %v", os.Args[3], err)
 	}
 
+	if truncated {
+		fmt.Printf("Extracted %d of %d bytes to %s (chain truncated; the rest could not be located)\n",
+			len(data), target.Size(), os.Args[3])
+		return
+	}
 	fmt.Printf("Extracted %d bytes to %s\n", len(data), os.Args[3])
 }

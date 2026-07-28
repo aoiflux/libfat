@@ -16,6 +16,22 @@ var (
 	ErrNotFile           = errors.New("not a file")
 	ErrIsDirectory       = errors.New("is a directory")
 	ErrCorruptStructure  = errors.New("corrupt filesystem structure")
+
+	// ErrTruncatedChain reports that a cluster chain covered fewer bytes than
+	// the directory entry's recorded size. This is the normal outcome for
+	// deleted entries whose FAT entries have been freed: the chain walk stops
+	// after the first cluster because the FAT no longer records a successor.
+	// Callers that tolerate partial data should check with errors.Is and use
+	// whatever bytes or ranges were returned alongside the error.
+	ErrTruncatedChain = errors.New("cluster chain shorter than entry size")
+
+	// ErrFragmented reports that an operation requiring a single contiguous
+	// extent was attempted on a file stored in more than one run.
+	ErrFragmented = errors.New("file is fragmented")
+
+	// ErrNoDataClusters reports that an entry has no allocatable first cluster
+	// (an empty file, or an entry whose cluster fields were zeroed).
+	ErrNoDataClusters = errors.New("entry has no data clusters")
 )
 
 type VolumeError struct {
