@@ -5,7 +5,88 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - Unreleased
+## [0.3.0] - Unreleased
+
+The Go API is additive: no exported symbol was removed, renamed, or
+re-signatured. The *JSON* output of the previously untagged exported structs
+does change, which is called out under *Changed*.
+
+### Added
+
+- **Recursive walk.** `Volume.Walk(ctx, fn)` and
+  `Volume.WalkWithOptions(ctx, opts, fn)` call
+  `fn(path, parentFirstCluster, entry)` for every entry in the tree, depth first
+  and in the order records appear on disk. Callers no longer hand-roll recursion
+  over `ReadDir`. The root is not reported: it has no directory record anywhere
+  on the volume, and synthesising one would fabricate a structure that does not
+  exist.
+- `WalkOptions` selects deleted records (`IncludeDeleted`,
+  `DescendDeletedDirectories`) and unreachable directory data (`IncludeOrphans`,
+  `OrphanScan`), and bounds the walk (`MaxDepth`, `StopOnReadError`). The zero
+  value is the live reachable tree, so one pass can serve both change detection
+  and recovery without either silently becoming the other.
+- Descending into a deleted directory reads only its first cluster, requires
+  that cluster to still be free in the FAT and to still begin with `.` and `..`
+  pointing at itself, and never walks the FAT - the same rule
+  `FragmentOffsets` applies to deleted files, for the same reason.
+- **Composite file identity.** `FileID{ParentFirstCluster, EntrySlotIndex}`,
+  `Volume.FileID(entry) (FileID, bool)`, the new `DirEntry.ParentFirstCluster`
+  field, and the `FixedRootCluster` constant for the FAT12/16 root region, which
+  is not cluster-addressed.
+- The identity is documented as what it is: an address, not an identity. FAT has
+  no inode and no reuse counter, so a slot reused after a deletion carries its
+  previous occupant's `FileID` exactly, and a rename that changes the number of
+  long-name slots moves the entry to a different one. It survives the parent
+  directory being relocated, which `EntryAbsoluteOffset` does not. Rename
+  detection on FAT is inference, never proof; see the *File identity* section of
+  the package documentation for the corroborating signals.
+- **Cancellation.** `Volume.ScanOrphansContext(ctx, opts)`, with `ScanOrphans`
+  now a one-line delegate. Cancellation reaches all three phases of a scan - the
+  reachability pre-pass, the cluster sweep and the continuation-run gather -
+  paced by one counter spanning the whole operation. A cancelled scan returns
+  its partial `*OrphanScanResult` with `Truncated` set alongside `ctx.Err()`.
+  New sentinels `ErrNilContext` and `ErrNilCallback`.
+- **JSON report.** `Volume.Report`, `ReportDeep`, `ReportWithOptions` and
+  `ReportWithOptionsContext`, with the matching `WriteReport` quartet writing
+  indented JSON to an `io.Writer`. `FATReport` carries `FATMeta` and `FATFile`
+  rows in the shape the sibling filesystem libraries emit.
+- `FileFragment` is the report's extent type, converted from `Range`, with an
+  exclusive `EndOffset` and the FAT-native cluster addressing alongside the byte
+  offsets. `FragmentProvenance` carries `FragmentResult`'s `ChainWalked`,
+  `Assumed`, `Truncated`, `ChainBroken`, `LoopDetected` and
+  `FirstClusterReallocated` into every row, none of them omitted when false: a
+  hypothesised extent must never be indistinguishable from a verified one.
+- `ReportDeep` widens the search but never relaxes the evidence. It does not set
+  `AssumeContiguous`, because a report labelled deep that silently contained
+  hypotheses would be the worst possible default.
+- `FATReportSummary` and the `Summary` / `FilterFiles` / `FilesByType` /
+  `DeletedFiles` / `OrphanedFiles` / `FragmentedFiles` / `AssumedFiles` query
+  helpers on `*FATReport`.
+- `Timestamps` groups an entry's times for serialisation, with `DirEntry.Timestamps()`.
+- `NameSource` marshals as its label rather than its number, and round-trips.
+- Fuzz targets `FuzzWalk` and `FuzzReport`, bringing the total to seven. `Walk`
+  is the first API here that recurses on attacker-controlled structure, with
+  three independent termination arguments that all have to hold at once.
+- Package documentation gains *Walking the tree*, *File identity*,
+  *Cancellation* and *JSON reports*.
+
+### Changed
+
+- **The JSON field names of the exported structs changed.** `Range`,
+  `FragmentResult`, `FragmentOptions`, `DirEntry`, `BootSector`, `FAT32FSInfo`,
+  `OpenOptions`, `OrphanScanOptions`, `OrphanDirectory` and `OrphanScanResult`
+  gained snake_case tags, so a caller already marshalling them sees `name` where
+  it previously saw `Name`. Timestamps an entry never recorded are now absent
+  rather than rendered as `0001-01-01T00:00:00Z`, and `NameSource` marshals as
+  `"recovered-lfn"` rather than `2`. The Go types are unchanged, except that a
+  caller converting `DirEntry` to an identically-shaped untagged struct will no
+  longer compile, since struct tags participate in type identity.
+- `Volume.Walk` does not report deleted entries by default, unlike `File.ReadDir`
+  which has always returned them unconditionally. A directory listing that hid
+  them would hide the point of this package; a walk is a different operation and
+  makes the choice explicit.
+
+## [0.2.0] - 2026-07-28
 
 Every change is additive: no exported symbol was removed, renamed, or
 re-signatured. Two behaviour changes are called out under *Fixed* and *Changed*

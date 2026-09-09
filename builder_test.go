@@ -1,6 +1,8 @@
 package libfat
 
 import (
+	"context"
+	"io"
 	"strings"
 	"testing"
 )
@@ -250,17 +252,21 @@ func (im *testImage) addFile(f testFile) {
 	im.addRootRaw(raw...)
 }
 
-// addSubdir creates a subdirectory occupying the given clusters and fills it
-// with "." and ".." followed by entries. Passing non-adjacent clusters produces
-// a fragmented directory, which is what exercises absolute-offset mapping.
-func (im *testImage) addSubdir(name string, clusters []uint32, entries ...[]byte) {
+// writeSubdir lays out a directory's "." and ".." records followed by entries
+// across the given clusters and links the chain, without adding an entry for it
+// to any parent. addSubdir is this plus a root entry; nesting is built by
+// passing makeTimestampedEntry(name, "", 0x10, clusters[0], 0) as one of the
+// outer directory's entries.
+func (im *testImage) writeSubdir(clusters []uint32, parent uint32, entries ...[]byte) {
 	im.t.Helper()
 
 	im.linkChain(clusters, true)
 
 	content := make([]byte, len(clusters)*int(im.bytesPerCluster()))
 	dot := makeShortEntry(".", "", 0x10, uint16(clusters[0]), 0)
-	dotdot := makeShortEntry("..", "", 0x10, 0, 0)
+	putUint16LE(dot, 20, uint16(clusters[0]>>16))
+	dotdot := makeShortEntry("..", "", 0x10, uint16(parent), 0)
+	putUint16LE(dotdot, 20, uint16(parent>>16))
 	copy(content[0:dirEntrySize], dot)
 	copy(content[dirEntrySize:2*dirEntrySize], dotdot)
 	cursor := 2 * dirEntrySize
@@ -269,6 +275,15 @@ func (im *testImage) addSubdir(name string, clusters []uint32, entries ...[]byte
 		cursor += dirEntrySize
 	}
 	im.writeClusterData(clusters, content)
+}
+
+// addSubdir creates a subdirectory occupying the given clusters and fills it
+// with "." and ".." followed by entries. Passing non-adjacent clusters produces
+// a fragmented directory, which is what exercises absolute-offset mapping.
+func (im *testImage) addSubdir(name string, clusters []uint32, entries ...[]byte) {
+	im.t.Helper()
+
+	im.writeSubdir(clusters, 0, entries...)
 
 	dirEntry := makeShortEntry(name, "", 0x10, uint16(clusters[0]), 0)
 	putUint16LE(dirEntry, 20, uint16(clusters[0]>>16))
@@ -374,4 +389,37 @@ func patternBytes(n int, seed byte) []byte {
 		out[i] = seed ^ byte(i*7+i/251)
 	}
 	return out
+}
+
+// cancelAfterReaderAt cancels a context once n ReadAt calls have been served,
+// which makes cancellation mid-operation deterministic instead of dependent on
+// timing. Reads keep succeeding afterwards, so the operation under test stops
+// because it noticed the cancellation rather than because the image ran out.
+type cancelAfterReaderAt struct {
+	inner  io.ReaderAt
+	n      int
+	count  int
+	cancel context.CancelFunc
+}
+
+func (c *cancelAfterReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	c.count++
+	if c.count == c.n {
+		c.cancel()
+	}
+	return c.inner.ReadAt(p, off)
+}
+
+// volumeCancellingAfter opens the image over a reader that cancels the returned
+// context after n reads.
+func (im *testImage) volumeCancellingAfter(n int) (*Volume, context.Context) {
+	im.t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := &cancelAfterReaderAt{inner: &mockReaderAt{data: im.data}, n: n, cancel: cancel}
+	v, err := Open(reader)
+	if err != nil {
+		cancel()
+		im.t.Fatalf("Open failed: %v", err)
+	}
+	return v, ctx
 }

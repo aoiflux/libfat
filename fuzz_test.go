@@ -2,6 +2,9 @@ package libfat
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 )
 
@@ -251,5 +254,128 @@ func FuzzOpenPath(f *testing.F) {
 		}
 		_, _ = file.Fragments()
 		_, _ = file.IsFragmented()
+	})
+}
+
+// FuzzWalk exercises the first API in this package that recurses on
+// attacker-controlled structure. Walk has three independent termination
+// arguments - the cycle guard, the depth cap and cancellation - and all three
+// have to hold at once on an adversarial tree. FuzzScanOrphans does not cover
+// it: the orphan sweep is linear and never recurses on the contents of an
+// entry.
+func FuzzWalk(f *testing.F) {
+	f.Add(newFuzzImage(f, FATType16), false, false, false, uint8(0))
+	f.Add(newFuzzImage(f, FATType12), true, true, false, uint8(3))
+	f.Add(newFuzzImage(f, FATType16), true, false, true, uint8(0))
+	f.Add(make([]byte, 512), true, true, true, uint8(1))
+
+	// errBudget bounds the walk so that a synthesised volume with an enormous
+	// tree cannot dominate the fuzz budget. Returning it also exercises the
+	// contract that a callback error is returned unchanged.
+	errBudget := errors.New("fuzz budget exhausted")
+
+	f.Fuzz(func(t *testing.T, data []byte, includeDeleted, descendDeleted, includeOrphans bool, maxDepth uint8) {
+		v, err := Open(bytes.NewReader(data))
+		if err != nil {
+			return
+		}
+		defer v.Close()
+
+		calls := 0
+		walkErr := v.WalkWithOptions(context.Background(), WalkOptions{
+			IncludeDeleted:            includeDeleted,
+			DescendDeletedDirectories: descendDeleted,
+			IncludeOrphans:            includeOrphans,
+			OrphanScan:                OrphanScanOptions{MaxClusters: 4096, MaxDirectories: 32},
+			MaxDepth:                  int(maxDepth),
+		}, func(path string, parent uint32, e DirEntry) error {
+			calls++
+			if calls > 4096 {
+				return errBudget
+			}
+			if path == "" || path[0] != '/' {
+				t.Fatalf("path %q is not rooted", path)
+			}
+			// The two documented redundancies must hold for every entry.
+			if path != e.Path {
+				t.Fatalf("path %q != entry.Path %q", path, e.Path)
+			}
+			if parent != e.ParentFirstCluster {
+				t.Fatalf("parent %d != entry.ParentFirstCluster %d", parent, e.ParentFirstCluster)
+			}
+			if parent != FixedRootCluster && (parent < defaultRootCluster || parent > v.maxClusterNumber()) {
+				t.Fatalf("parent cluster %d is neither the root sentinel nor a valid cluster", parent)
+			}
+			if id, ok := v.FileID(e); ok {
+				if int64(id.EntrySlotIndex)*dirEntrySize != e.EntryOffset {
+					t.Fatalf("slot %d does not correspond to entry offset %d",
+						id.EntrySlotIndex, e.EntryOffset)
+				}
+			}
+			return nil
+		})
+		if walkErr != nil && !errors.Is(walkErr, errBudget) {
+			// Any other error is a legitimate outcome on a corrupt image; the
+			// property under test is that the walk terminates without panicking.
+			return
+		}
+	})
+}
+
+// FuzzReport reaches Walk, ScanOrphans and the fragment resolver in one call,
+// and additionally drives the JSON encoder over names decoded from arbitrary
+// UTF-16, which is where an encoding failure would surface.
+func FuzzReport(f *testing.F) {
+	f.Add(newFuzzImage(f, FATType16), false, false)
+	f.Add(newFuzzImage(f, FATType12), true, true)
+	f.Add(make([]byte, 512), true, false)
+
+	f.Fuzz(func(t *testing.T, data []byte, deep, assumeContiguous bool) {
+		v, err := Open(bytes.NewReader(data))
+		if err != nil {
+			return
+		}
+		defer v.Close()
+
+		opts := ReportOptions{
+			OrphanScan: OrphanScanOptions{MaxClusters: 4096, MaxDirectories: 32},
+			Fragments:  FragmentOptions{AssumeContiguous: assumeContiguous, MaxRuns: 256, MaxClusters: 4096},
+			MaxDepth:   8,
+		}
+		if deep {
+			opts.IncludeDeleted = true
+			opts.DescendDeletedDirectories = true
+			opts.IncludeOrphans = true
+		}
+
+		// A bounded or degraded scan still yields a report, and the partial
+		// result is exactly as worth checking as a complete one.
+		report, _ := v.ReportWithOptions("fuzz", opts)
+		if report == nil {
+			return
+		}
+		if _, err := json.Marshal(report); err != nil {
+			t.Fatalf("a report failed to marshal: %v", err)
+		}
+
+		volumeSize := v.VolumeSize()
+		for _, row := range report.Files {
+			for _, frag := range row.Fragments {
+				if frag.Sparse {
+					t.Fatalf("%s: FAT has no sparse allocation", row.Filename)
+				}
+				if frag.StartOffset < 0 || frag.Length < 0 {
+					t.Fatalf("%s: negative fragment %+v", row.Filename, frag)
+				}
+				if frag.EndOffset != frag.StartOffset+frag.Length {
+					t.Fatalf("%s: EndOffset %d is not exclusive of a %d-byte run at %d",
+						row.Filename, frag.EndOffset, frag.Length, frag.StartOffset)
+				}
+				if uint64(frag.EndOffset) > volumeSize {
+					t.Fatalf("%s: fragment ends at %d, past the %d-byte volume",
+						row.Filename, frag.EndOffset, volumeSize)
+				}
+			}
+		}
 	})
 }

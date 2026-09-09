@@ -15,19 +15,19 @@ import (
 // a file without re-walking the FAT.
 type Range struct {
 	// StartByte is the absolute byte offset of the run within the volume.
-	StartByte int64
+	StartByte int64 `json:"start_byte"`
 	// Length is the number of bytes in the run.
-	Length int64
+	Length int64 `json:"length"`
 	// Sparse is always false on FAT: the format has no sparse allocation and
 	// every run is backed by real clusters. The field exists so that callers
 	// can treat FAT ranges uniformly with filesystems that do have holes.
-	Sparse bool
+	Sparse bool `json:"sparse"`
 	// StartCluster is the first cluster of the run, or 0 for the fixed-size
 	// root directory region of FAT12 and FAT16, which is not cluster-addressed.
-	StartCluster uint32
+	StartCluster uint32 `json:"start_cluster"`
 	// ClusterCount is the number of clusters in the run, or 0 for the fixed
 	// root directory region.
-	ClusterCount uint32
+	ClusterCount uint32 `json:"cluster_count"`
 }
 
 // EndByte returns the offset one past the last byte of the run.
@@ -49,31 +49,31 @@ func (r Range) String() string {
 type FragmentResult struct {
 	// Ranges are the coalesced runs, in file order. Always usable even when a
 	// degradation flag is set: partial results are returned, never discarded.
-	Ranges []Range
+	Ranges []Range `json:"ranges"`
 	// BytesCovered is the sum of Range.Length.
-	BytesCovered int64
+	BytesCovered int64 `json:"bytes_covered"`
 	// ChainWalked is true when Ranges came from an actual FAT chain walk. It is
 	// false for deleted entries, whose FAT entries no longer describe them, and
 	// for the fixed root directory region.
-	ChainWalked bool
+	ChainWalked bool `json:"chain_walked"`
 	// Truncated is true when BytesCovered is less than the entry's size.
-	Truncated bool
+	Truncated bool `json:"truncated"`
 	// Assumed is true when runs were synthesized under FragmentOptions'
 	// AssumeContiguous rather than read from the FAT. Data located through
 	// assumed ranges is a hypothesis, not a fact.
-	Assumed bool
+	Assumed bool `json:"assumed"`
 	// ChainBroken is true when the walk stopped on a free, bad, or
 	// out-of-range FAT entry instead of a proper end-of-chain marker.
-	ChainBroken bool
+	ChainBroken bool `json:"chain_broken"`
 	// LoopDetected is true when the chain revisited a cluster. The walk stops
 	// at the repeat; earlier runs remain valid.
-	LoopDetected bool
+	LoopDetected bool `json:"loop_detected"`
 	// FirstClusterReallocated is true for a deleted entry whose first cluster
 	// is now marked in use, meaning its content was likely overwritten by a
 	// later file. Recovery from these ranges is unlikely to succeed.
-	FirstClusterReallocated bool
+	FirstClusterReallocated bool `json:"first_cluster_reallocated"`
 	// ClustersWalked counts clusters visited, including those coalesced away.
-	ClustersWalked uint32
+	ClustersWalked uint32 `json:"clusters_walked"`
 }
 
 // FragmentOptions tunes how runs are derived.
@@ -83,13 +83,13 @@ type FragmentOptions struct {
 	// clusters follow FirstCluster contiguously. It sets FragmentResult.Assumed
 	// and is off by default so that callers never receive fabricated offsets
 	// they did not ask for.
-	AssumeContiguous bool
+	AssumeContiguous bool `json:"assume_contiguous"`
 	// MaxRuns caps the number of runs returned. Zero means unlimited. Use it to
 	// bound work on hostile images with pathologically fragmented chains.
-	MaxRuns int
+	MaxRuns int `json:"max_runs"`
 	// MaxClusters caps the number of clusters walked. Zero defaults to the
 	// volume's total cluster count, which is already a hard upper bound.
-	MaxClusters uint32
+	MaxClusters uint32 `json:"max_clusters"`
 }
 
 // FragmentOffsets returns the absolute byte ranges occupied by entry.

@@ -108,6 +108,61 @@ if err != nil {
 defer vol.Close()
 ```
 
+## Walking the tree
+
+`Walk` visits every entry depth first, in the order records appear on disk, so
+callers do not hand-roll recursion over `ReadDir`:
+
+```go
+ctx := context.Background()
+err := v.Walk(ctx, func(path string, parentFirstCluster uint32, e libfat.DirEntry) error {
+    fmt.Println(path, e.Size)
+    return nil
+})
+```
+
+The root is not reported: it has no directory record anywhere on the volume, and
+synthesising one would fabricate a structure that does not exist. The zero
+`WalkOptions` covers the live, reachable tree; deleted records and orphan runs
+are opt-in, which is deliberately unlike `ReadDir`.
+
+```go
+err := v.WalkWithOptions(ctx, libfat.WalkOptions{
+    IncludeDeleted:            true,
+    DescendDeletedDirectories: true,
+    IncludeOrphans:            true,
+}, fn)
+```
+
+### File identity
+
+`EntryAbsoluteOffset` says where a record is now; `FileID` says which record it
+is. A defragmentation pass rewrites the first for every entry in a directory
+while changing no file — the slot index, being logical, does not move.
+
+```go
+id, ok := v.FileID(entry) // {ParentFirstCluster, EntrySlotIndex}
+```
+
+It is an address, not an identity. FAT has no inode and **no reuse or generation
+counter**, so a slot reused after a deletion carries its previous occupant's
+`FileID` exactly, and a rename that changes the number of long-name slots moves
+the entry to a different one. **Rename detection on FAT is inference, never
+proof** — corroborate with `CreatedAt`, `FirstCluster` and `Size`. See the *File
+identity* section of the package documentation for the full account.
+
+## JSON reports
+
+```go
+err := v.WriteReportDeep("evidence.img", os.Stdout)
+```
+
+Every row carries a `layout` object holding the provenance flags — `chain_walked`,
+`assumed`, `truncated`, `chain_broken`, `loop_detected`,
+`first_cluster_reallocated` — none of them omitted when false, so a hypothesised
+extent is never indistinguishable from a verified one. `ReportDeep` searches more
+places but never relaxes the evidence: it does not set `AssumeContiguous`.
+
 ## Locating file data
 
 For forensic work the central operation is mapping a file to the byte ranges it
@@ -186,6 +241,25 @@ Volume-level:
   and orphaned entries, which no path resolves to
 - `(*Volume).GetBootSector() *BootSector`
 
+Walking the tree:
+
+- `(*Volume).Walk(ctx, func(path string, parentFirstCluster uint32, e DirEntry) error) error`
+- `(*Volume).WalkWithOptions(ctx, opts WalkOptions, fn) error` — deleted records
+  and unreachable directory data are opt-in, so one pass serves both change
+  detection and recovery
+- `(*Volume).FileID(entry DirEntry) (FileID, bool)` — the composite
+  `{ParentFirstCluster, EntrySlotIndex}` identity, and `FixedRootCluster` for
+  the FAT12/16 root region
+
+Reports:
+
+- `(*Volume).Report(name string) (*FATReport, error)`, `ReportDeep`,
+  `ReportWithOptions`, `ReportWithOptionsContext`
+- `(*Volume).WriteReport(name string, w io.Writer) error`, `WriteReportDeep`,
+  `WriteReportWithOptions`, `WriteReportWithOptionsContext`
+- `(*FATReport).Summary()`, `FilterFiles`, `FilesByType`, `DeletedFiles`,
+  `OrphanedFiles`, `FragmentedFiles`, `AssumedFiles`
+
 Fragments and offsets:
 
 - `(*Volume).FragmentOffsets(entry DirEntry) ([]Range, error)`
@@ -196,6 +270,7 @@ Fragments and offsets:
 - `(*Volume).SlackRange(entry DirEntry) (Range, bool, error)`
 - `(*Volume).IsFragmented(entry DirEntry) (bool, error)`
 - `(*Volume).ScanOrphans(opts OrphanScanOptions) (*OrphanScanResult, error)`
+- `(*Volume).ScanOrphansContext(ctx, opts OrphanScanOptions) (*OrphanScanResult, error)`
 - `IsFragmented(ranges []Range) bool`, `TotalLength(ranges []Range) int64`,
   `Coalesce(ranges []Range) []Range`
 
@@ -215,11 +290,14 @@ File-level:
 
 - `examples/basic`: open a volume/image (optionally force FAT12/FAT16/FAT32),
   print volume metadata, list root directory
-- `examples/traverse`: recursively walk a directory subtree with summary stats
+- `examples/traverse`: walk the whole tree with `Volume.Walk`, printing each
+  entry's `FileID`; `-deleted` and `-orphans` widen it to recovery material
 - `examples/extract`: extract a file from a FAT volume to a local output path
 - `examples/fragments`: print the absolute image byte ranges of every file,
   including deleted entries, slack, and orphans recovered from deleted
   directories
+- `examples/report`: write a JSON forensic report to stdout; `-deep` adds
+  deleted records and unreachable directory data
 
 Run one example:
 

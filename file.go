@@ -270,12 +270,28 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 		includeVolumeLabels: f.volume.includeVolumeLabelEntries,
 		recoverDeletedLFN:   f.volume.recoverDeletedLongNames,
 		mapOffset:           rangeOffsetMapper(ranges),
+		parentFirstCluster:  f.identityCluster(),
 	}
 	entries := parseDirectoryEntries(data, ctx)
 	if f.isRoot && f.volume.includeVirtualRootEntries {
 		entries = append(entries, virtualRootEntries()...)
 	}
 	return entries, nil
+}
+
+// identityCluster is the cluster number that identifies this directory for the
+// purposes of DirEntry.ParentFirstCluster.
+//
+// It is not always f.firstCluster. GetRootDirectory sets firstCluster to
+// v.rootCluster, which applyBootSector fills with 2 on FAT12 and FAT16 even
+// though those volumes' roots are a fixed region and not cluster-addressed at
+// all. Reporting 2 there would collide with whatever directory really occupies
+// cluster 2, so the fixed root region reports FixedRootCluster instead.
+func (f *File) identityCluster() uint32 {
+	if f.isRoot && f.volume.fatType != FATType32 {
+		return FixedRootCluster
+	}
+	return f.firstCluster
 }
 
 func (f *File) ListFiles() ([]DirEntry, error) {
@@ -306,6 +322,60 @@ func (f *File) ListDirectories() ([]DirEntry, error) {
 	return dirs, nil
 }
 
+// deletedDirectoryChildren parses the surviving records in the first cluster of
+// a deleted directory. The boolean is false when the cluster no longer holds
+// that directory's data, which is the common outcome and not an error.
+//
+// Only one cluster is read. Deletion frees the FAT chain, so there is no chain
+// to follow; walking the FAT from the first cluster would report whatever now
+// owns it as this directory's contents, which is the error FragmentOffsets
+// refuses to make for deleted files. Contiguity is not assumed either. Two
+// conditions must hold before anything is returned: the FAT must still mark the
+// cluster free, and the cluster must still begin with the "." and ".." records
+// with "." pointing back at itself, which is the guard that separates surviving
+// directory data from a later file that happens to start there.
+func (v *Volume) deletedDirectoryChildren(e DirEntry) ([]DirEntry, bool, error) {
+	if e.ClusterAllocated {
+		// Reallocated: the cluster now belongs to something else.
+		return nil, false, nil
+	}
+	if e.FirstCluster < defaultRootCluster || e.FirstCluster > v.maxClusterNumber() {
+		return nil, false, nil
+	}
+	if v.bytesPerCluster == 0 {
+		return nil, false, fmt.Errorf("%w: volume has no cluster size", ErrCorruptStructure)
+	}
+
+	buf := make([]byte, v.bytesPerCluster)
+	if err := v.readClusterInto(buf, e.FirstCluster); err != nil {
+		return nil, false, err
+	}
+	if _, hasDots := dotEntryParent(buf, e.FirstCluster); !hasDots {
+		// A stale copy, or overwritten by a later file.
+		return nil, false, nil
+	}
+
+	offset, err := v.clusterToOffset(e.FirstCluster)
+	if err != nil {
+		return nil, false, err
+	}
+	ranges := []Range{{
+		StartByte:    offset,
+		Length:       int64(v.bytesPerCluster),
+		StartCluster: e.FirstCluster,
+		ClusterCount: 1,
+	}}
+	entries := parseDirectoryEntries(buf, &dirParseContext{
+		dirPath:             e.Path,
+		isClusterAllocated:  v.IsClusterAllocated,
+		includeVolumeLabels: v.includeVolumeLabelEntries,
+		recoverDeletedLFN:   v.recoverDeletedLongNames,
+		mapOffset:           rangeOffsetMapper(ranges),
+		parentFirstCluster:  e.FirstCluster,
+	})
+	return entries, true, nil
+}
+
 // dirParseContext carries everything parseDirectoryEntries needs beyond the raw
 // directory bytes.
 type dirParseContext struct {
@@ -316,6 +386,11 @@ type dirParseContext struct {
 	// mapOffset translates an offset within the directory's concatenated data
 	// into an absolute image offset. It is nil when the mapping is unavailable.
 	mapOffset func(int64) int64
+	// parentFirstCluster is the first cluster of the directory whose data this
+	// is, or FixedRootCluster for the FAT12/16 root region. It is copied onto
+	// every entry so that an entry carries the logical address of its own record
+	// and not only the physical one, which relocation invalidates.
+	parentFirstCluster uint32
 }
 
 func (c *dirParseContext) absolute(bufOffset int) int64 {
@@ -458,6 +533,7 @@ func parseDirectoryEntries(data []byte, ctx *dirParseContext) []DirEntry {
 						EntryAbsoluteOffset: ctx.absolute(offset),
 						LFNEntryOffset:      -1,
 						DirectoryPath:       ctx.dirPath,
+						ParentFirstCluster:  ctx.parentFirstCluster,
 					})
 				}
 			}
@@ -531,6 +607,7 @@ func parseDirectoryEntries(data []byte, ctx *dirParseContext) []DirEntry {
 			EntryAbsoluteOffset: ctx.absolute(offset),
 			LFNEntryOffset:      lfnOffset,
 			DirectoryPath:       ctx.dirPath,
+			ParentFirstCluster:  ctx.parentFirstCluster,
 			NameSource:          nameSource,
 			FirstCharRecovered:  firstCharFixed,
 		})

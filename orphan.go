@@ -1,6 +1,7 @@
 package libfat
 
 import (
+	"context"
 	"fmt"
 	"io"
 )
@@ -14,36 +15,36 @@ type OrphanScanOptions struct {
 	// ScanAllocatedClusters also examines clusters the FAT marks in use. Those
 	// clusters belong to live files, so any directory data found in them is
 	// stale content that a later file was written over. Off by default.
-	ScanAllocatedClusters bool
+	ScanAllocatedClusters bool `json:"scan_allocated_clusters"`
 
 	// AllowMissingDotEntries accepts any cluster whose records all parse as
 	// directory entries, rather than only the first cluster of a directory.
 	// It finds directory fragments whose start has been overwritten, at the
 	// cost of false positives from files that happen to contain entry-shaped
 	// bytes.
-	AllowMissingDotEntries bool
+	AllowMissingDotEntries bool `json:"allow_missing_dot_entries"`
 
 	// OnlyFirstCluster reports just the cluster where a directory was found,
 	// without gathering the contiguous clusters that follow it. Directories are
 	// usually laid out contiguously, so following them recovers entries beyond
 	// the first cluster of a large directory.
-	OnlyFirstCluster bool
+	OnlyFirstCluster bool `json:"only_first_cluster"`
 
 	// MinValidEntries is the number of well-formed records a cluster must hold
 	// before it is treated as directory data. Zero selects 1.
-	MinValidEntries int
+	MinValidEntries int `json:"min_valid_entries"`
 
 	// MaxClusters bounds how many clusters are examined. Zero scans the whole
 	// data area.
-	MaxClusters uint32
+	MaxClusters uint32 `json:"max_clusters"`
 
 	// MaxDirectories bounds how many orphan directories are returned. Zero
 	// means unlimited.
-	MaxDirectories int
+	MaxDirectories int `json:"max_directories"`
 
 	// MaxDepth bounds the walk of the reachable tree that determines which
 	// clusters are already accounted for. Zero selects 64.
-	MaxDepth int
+	MaxDepth int `json:"max_depth"`
 }
 
 // OrphanDirectory is a run of clusters holding directory data that is not
@@ -51,37 +52,37 @@ type OrphanScanOptions struct {
 type OrphanDirectory struct {
 	// Ranges are the absolute image byte ranges of the clusters the directory
 	// data was found in.
-	Ranges []Range
+	Ranges []Range `json:"ranges"`
 	// FirstCluster is the cluster where the directory data starts.
-	FirstCluster uint32
+	FirstCluster uint32 `json:"first_cluster"`
 	// ParentCluster is the first cluster of the parent directory, taken from
 	// the ".." record. Zero means the root directory, or that the record was
 	// absent.
-	ParentCluster uint32
+	ParentCluster uint32 `json:"parent_cluster"`
 	// HasDotEntries is true when the run began with the "." and ".." records
 	// that mark the first cluster of a directory. When false, the run was
 	// identified only by the shape of its records and is a weaker finding.
-	HasDotEntries bool
+	HasDotEntries bool `json:"has_dot_entries"`
 	// Entries are the directory entries recovered from the run. Their Path is
 	// rooted at /$OrphanFiles because the original path is not recoverable:
 	// the parent chain that named this directory is gone.
-	Entries []DirEntry
+	Entries []DirEntry `json:"entries"`
 }
 
 // OrphanScanResult reports the outcome of a scan.
 type OrphanScanResult struct {
-	Directories []OrphanDirectory
+	Directories []OrphanDirectory `json:"directories"`
 	// ClustersScanned counts clusters read, whether or not they matched.
-	ClustersScanned uint32
+	ClustersScanned uint32 `json:"clusters_scanned"`
 	// ClustersSkipped counts clusters not examined because they were reachable
 	// from the root or allocated.
-	ClustersSkipped uint32
+	ClustersSkipped uint32 `json:"clusters_skipped"`
 	// Truncated is true when a bound in OrphanScanOptions stopped the scan
 	// before the data area was exhausted.
-	Truncated bool
+	Truncated bool `json:"truncated"`
 	// ReachableWalkFailed is true when part of the live directory tree could
 	// not be walked, so some reported orphans may in fact be reachable.
-	ReachableWalkFailed bool
+	ReachableWalkFailed bool `json:"reachable_walk_failed"`
 }
 
 // Entries flattens the recovered entries across all orphan directories.
@@ -112,9 +113,43 @@ const OrphanPath = "/$OrphanFiles"
 // Recovered entries carry Orphaned set and a Path under OrphanPath. Their
 // original paths are not recoverable, because the directory chain that named
 // them is exactly what was lost.
+//
+// It is ScanOrphansContext with context.Background(). A scan costs a pass over
+// the data area, so prefer the Context form on any image large enough to want
+// interrupting.
 func (v *Volume) ScanOrphans(opts OrphanScanOptions) (*OrphanScanResult, error) {
+	return v.ScanOrphansContext(context.Background(), opts)
+}
+
+// ScanOrphansContext is ScanOrphans with cancellation.
+//
+// Cancellation reaches all three phases of the scan: the reachability pre-pass
+// that walks the live tree to learn which clusters are already accounted for,
+// the sweep over the data area, and the gathering of each orphan run's
+// continuation clusters. One counter paces the checks across all three, so a
+// volume whose pre-pass dominates the runtime is as interruptible as one whose
+// sweep does.
+//
+// On cancellation the partial *OrphanScanResult is returned alongside
+// ctx.Err(), with Truncated set. That differs from the sibling filesystem
+// libraries, which return nothing from a cancelled report, and follows this
+// package's own rule instead: FragmentOffsets returns the runs it walked
+// alongside ErrTruncatedChain, and a half-finished orphan scan is worth the
+// same. The error is returned unchanged, so errors.Is(err, context.Canceled)
+// works and a caller wanting all-or-nothing discards the result on any non-nil
+// error.
+//
+// One caveat bounds how promptly a cancellation takes effect. The reachability
+// pre-pass walks a FAT chain per live directory through code that has no
+// context of its own, so the worst-case latency between two checks is one full
+// directory chain walk. Bound that with OrphanScanOptions.MaxClusters and
+// MaxDepth rather than relying on the context alone.
+func (v *Volume) ScanOrphansContext(ctx context.Context, opts OrphanScanOptions) (*OrphanScanResult, error) {
 	if v.IsClosed() {
 		return nil, ErrVolumeClosed
+	}
+	if ctx == nil {
+		return nil, ErrNilContext
 	}
 	if v.bytesPerCluster == 0 {
 		return nil, fmt.Errorf("%w: volume has no cluster size", ErrCorruptStructure)
@@ -133,14 +168,24 @@ func (v *Volume) ScanOrphans(opts OrphanScanOptions) (*OrphanScanResult, error) 
 		limit = v.clusterCount
 	}
 
-	reachable, walkOK := v.reachableDirectoryClusters(maxDepth)
+	prog := &scanProgress{ctx: ctx}
+	reachable, walkOK, err := v.reachableDirectoryClusters(prog, maxDepth)
 	result := &OrphanScanResult{ReachableWalkFailed: !walkOK}
+	if err != nil {
+		// Cancelled before any cluster of the data area was examined.
+		result.Truncated = true
+		return result, err
+	}
 
 	consumed := make(map[uint32]struct{})
 	buf := make([]byte, v.bytesPerCluster)
 	last := v.maxClusterNumber()
 
 	for cluster := uint32(defaultRootCluster); cluster <= last; cluster++ {
+		if err := prog.check(); err != nil {
+			result.Truncated = true
+			return result, err
+		}
 		if result.ClustersScanned >= limit {
 			result.Truncated = true
 			break
@@ -182,9 +227,13 @@ func (v *Volume) ScanOrphans(opts OrphanScanOptions) (*OrphanScanResult, error) 
 			}
 		}
 
-		dir := v.gatherOrphanDirectory(cluster, buf, parent, hasDots, opts, minEntries, reachable, consumed, result)
+		dir, gerr := v.gatherOrphanDirectory(prog, cluster, buf, parent, hasDots, opts, minEntries, reachable, consumed, result)
 		if len(dir.Entries) > 0 {
 			result.Directories = append(result.Directories, dir)
+		}
+		if gerr != nil {
+			result.Truncated = true
+			return result, gerr
 		}
 	}
 
@@ -194,6 +243,7 @@ func (v *Volume) ScanOrphans(opts OrphanScanOptions) (*OrphanScanResult, error) 
 // gatherOrphanDirectory collects the run of clusters starting at first and
 // parses the entries out of it.
 func (v *Volume) gatherOrphanDirectory(
+	prog *scanProgress,
 	first uint32,
 	firstData []byte,
 	parent uint32,
@@ -202,7 +252,7 @@ func (v *Volume) gatherOrphanDirectory(
 	minEntries int,
 	reachable, consumed map[uint32]struct{},
 	result *OrphanScanResult,
-) OrphanDirectory {
+) (OrphanDirectory, error) {
 	data := make([]byte, 0, len(firstData)*2)
 	data = append(data, firstData...)
 	clusters := []uint32{first}
@@ -211,6 +261,9 @@ func (v *Volume) gatherOrphanDirectory(
 	if !opts.OnlyFirstCluster {
 		buf := make([]byte, v.bytesPerCluster)
 		for next := first + 1; next <= v.maxClusterNumber(); next++ {
+			if err := prog.check(); err != nil {
+				return v.orphanDirectory(clusters, first, parent, hasDots, data), err
+			}
 			if _, ok := consumed[next]; ok {
 				break
 			}
@@ -239,6 +292,18 @@ func (v *Volume) gatherOrphanDirectory(
 		}
 	}
 
+	return v.orphanDirectory(clusters, first, parent, hasDots, data), nil
+}
+
+// orphanDirectory parses the gathered bytes into an OrphanDirectory. It is
+// factored out of gatherOrphanDirectory so that a cancelled gather still
+// reports the clusters it had already accepted rather than discarding them.
+func (v *Volume) orphanDirectory(
+	clusters []uint32,
+	first, parent uint32,
+	hasDots bool,
+	data []byte,
+) OrphanDirectory {
 	ranges := v.clustersToRanges(clusters)
 	ctx := &dirParseContext{
 		dirPath:             OrphanPath,
@@ -246,6 +311,7 @@ func (v *Volume) gatherOrphanDirectory(
 		includeVolumeLabels: false,
 		recoverDeletedLFN:   v.recoverDeletedLongNames,
 		mapOffset:           rangeOffsetMapper(ranges),
+		parentFirstCluster:  first,
 	}
 	entries := parseDirectoryEntries(data, ctx)
 	for i := range entries {
@@ -394,7 +460,7 @@ func isZeroed(data []byte) bool {
 // orphan recovery. The boolean reports whether the whole tree was walked; a
 // false value means some subtree failed to parse and its clusters are missing
 // from the set.
-func (v *Volume) reachableDirectoryClusters(maxDepth int) (map[uint32]struct{}, bool) {
+func (v *Volume) reachableDirectoryClusters(prog *scanProgress, maxDepth int) (map[uint32]struct{}, bool, error) {
 	seen := make(map[uint32]struct{})
 	visited := make(map[uint32]struct{})
 	ok := true
@@ -405,25 +471,33 @@ func (v *Volume) reachableDirectoryClusters(maxDepth int) (map[uint32]struct{}, 
 
 	root, err := v.GetRootDirectory()
 	if err != nil {
-		return seen, false
+		return seen, false, nil
 	}
-	v.walkReachable(root, 0, maxDepth, seen, visited, &ok)
-	return seen, ok
+	if cerr := v.walkReachable(prog, root, 0, maxDepth, seen, visited, &ok); cerr != nil {
+		return seen, ok, cerr
+	}
+	return seen, ok, nil
 }
 
-func (v *Volume) walkReachable(dir *File, depth, maxDepth int, seen, visited map[uint32]struct{}, ok *bool) {
+// walkReachable descends the live tree, recording the clusters each directory
+// occupies. Cancellation is returned as an error rather than folded into ok:
+// ok reports that a subtree failed to parse, which is a different finding.
+func (v *Volume) walkReachable(prog *scanProgress, dir *File, depth, maxDepth int, seen, visited map[uint32]struct{}, ok *bool) error {
 	if depth >= maxDepth {
 		*ok = false
-		return
+		return nil
 	}
 
 	entries, err := dir.ReadDir()
 	if err != nil {
 		*ok = false
-		return
+		return nil
 	}
 
 	for _, entry := range entries {
+		if cerr := prog.check(); cerr != nil {
+			return cerr
+		}
 		if !entry.IsDirectory || entry.Deleted || entry.Virtual {
 			continue
 		}
@@ -436,8 +510,11 @@ func (v *Volume) walkReachable(dir *File, depth, maxDepth int, seen, visited map
 		visited[entry.FirstCluster] = struct{}{}
 
 		v.addChainClusters(entry.FirstCluster, seen)
-		v.walkReachable(v.openDirEntry(entry), depth+1, maxDepth, seen, visited, ok)
+		if cerr := v.walkReachable(prog, v.openDirEntry(entry), depth+1, maxDepth, seen, visited, ok); cerr != nil {
+			return cerr
+		}
 	}
+	return nil
 }
 
 // addChainClusters records every cluster of a chain, tolerating breakage: a
