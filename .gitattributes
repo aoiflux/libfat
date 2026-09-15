@@ -1,0 +1,2 @@
+# The corpus generator runs under WSL; CRLF would break its shebang.
+*.sh text eol=lf

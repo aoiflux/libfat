@@ -65,7 +65,21 @@ type FATMeta struct {
 
 	SectorSize   int    `json:"sector_size"`
 	ClusterCount uint32 `json:"cluster_count"`
-	VolumeLabel  string `json:"volume_label,omitempty"`
+
+	// VolumeLabel is what the volume is called, taken from the label record in
+	// the root directory when there is one and from the boot sector otherwise.
+	// BootSectorVolumeLabel is the boot sector's copy on its own, and
+	// VolumeLabelSource says which of the two VolumeLabel came from.
+	//
+	// The two can easily disagree: the boot sector's is written at format time
+	// and never updated afterwards, and Windows leaves it reading "NO NAME"
+	// whatever the volume is called. Both are reported because the
+	// disagreement is itself evidence that the volume was labelled after it was
+	// formatted.
+	VolumeLabel           string `json:"volume_label,omitempty"`
+	BootSectorVolumeLabel string `json:"boot_sector_volume_label,omitempty"`
+	VolumeLabelSource     string `json:"volume_label_source,omitempty"`
+
 	VolumeSerial uint32 `json:"volume_serial"`
 
 	// UsedBackupBootSector is true when the primary boot sector was unusable
@@ -341,12 +355,14 @@ func (v *Volume) ReportWithOptionsContext(ctx context.Context, name string, opts
 
 func (v *Volume) reportMeta() FATMeta {
 	meta := FATMeta{
-		Type:                 v.FATType(),
-		BlockSize:            int(v.BytesPerCluster()),
-		SectorSize:           int(v.BytesPerSector()),
-		ClusterCount:         v.ClusterCount(),
-		VolumeLabel:          v.VolumeLabel(),
-		UsedBackupBootSector: v.UsedBackupBootSector(),
+		Type:                  v.FATType(),
+		BlockSize:             int(v.BytesPerCluster()),
+		SectorSize:            int(v.BytesPerSector()),
+		ClusterCount:          v.ClusterCount(),
+		VolumeLabel:           v.VolumeLabel(),
+		BootSectorVolumeLabel: v.BootSectorVolumeLabel(),
+		VolumeLabelSource:     v.VolumeLabelSource(),
+		UsedBackupBootSector:  v.UsedBackupBootSector(),
 	}
 	if offset, err := v.clusterToOffset(defaultRootCluster); err == nil {
 		meta.Offset = offset

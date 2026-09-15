@@ -42,6 +42,7 @@ type Volume struct {
 	clusterCount        uint32
 	volumeSize          uint64
 	volumeLabel         string
+	rootVolumeLabel     string
 	fsTypeHint          string
 	fsInfo              *FAT32FSInfo
 	fatMirrorMismatches uint64
@@ -87,7 +88,68 @@ func OpenWithOptions(reader io.ReaderAt, options OpenOptions) (*Volume, error) {
 	if err := v.parseBootSector(); err != nil {
 		return nil, wrapVolumeError("open", err)
 	}
+	v.rootVolumeLabel = v.readRootVolumeLabel()
 	return v, nil
+}
+
+// readRootVolumeLabel returns the label held by the volume-label record in the
+// root directory, or "" when there is none.
+//
+// FAT records a volume's label in two places, and only this one is
+// authoritative. The boot sector's BS_VolLab field is documented as
+// informational, and Windows leaves it reading "NO NAME" while writing the real
+// label into the root directory, so any volume labelled after it was formatted
+// disagrees with its own boot sector. Trusting the boot sector means reporting
+// a name no other tool and no operating system will show.
+//
+// Failure is not an error here. An unreadable root, a torn record or a scan
+// that reaches its bound all return "", and the boot sector's copy is used
+// instead; refusing to open a volume because its label could not be confirmed
+// would be a far worse trade. The bound exists because this runs on every open,
+// including on images chosen by no one trustworthy: the record is conventionally
+// the first in the root, so the limit is slack rather than a search.
+func (v *Volume) readRootVolumeLabel() string {
+	runs, err := v.RootDirectoryFragments()
+	if err != nil {
+		return ""
+	}
+	const maxScan = 1 << 20
+	buf := make([]byte, 32*dirEntrySize)
+	var scanned int64
+	for _, run := range runs {
+		for at := run.StartByte; at < run.EndByte(); {
+			chunk := run.EndByte() - at
+			if chunk > int64(len(buf)) {
+				chunk = int64(len(buf))
+			}
+			chunk -= chunk % dirEntrySize
+			if chunk == 0 || scanned >= maxScan {
+				return ""
+			}
+			if _, err := v.reader.ReadAt(buf[:chunk], at); err != nil {
+				return ""
+			}
+			scanned += chunk
+			at += chunk
+			for i := int64(0); i < chunk; i += dirEntrySize {
+				rec := buf[i : i+dirEntrySize]
+				switch {
+				case rec[0] == 0x00:
+					// End of directory: every record past here is unused.
+					return ""
+				case rec[0] == 0xE5:
+					continue
+				case rec[11] == attrLongName:
+					// A long-name slot sets the volume-ID bit without being a
+					// label, so it has to be excluded before the test below.
+					continue
+				case rec[11]&attrVolumeID != 0 && rec[11]&attrDirectory == 0:
+					return parseVolumeLabel(rec, false)
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func (v *Volume) Close() error {
@@ -391,8 +453,42 @@ func (v *Volume) VolumeSize() uint64 {
 	return v.volumeSize
 }
 
+// VolumeLabel returns the volume's label, preferring the record in the root
+// directory over the copy in the boot sector.
+//
+// The two can easily disagree: the boot sector copy is written once at format
+// time and never updated, so a volume renamed afterwards - or formatted by
+// Windows, which writes "NO NAME" there regardless - keeps a stale one. When
+// the root directory holds no label record the boot sector's copy is returned,
+// since a stale name is still better evidence than none. Use
+// BootSectorVolumeLabel to see that copy on its own, and FATMeta's
+// VolumeLabelSource to find out which of the two a report used.
 func (v *Volume) VolumeLabel() string {
+	if v.rootVolumeLabel != "" {
+		return v.rootVolumeLabel
+	}
 	return v.volumeLabel
+}
+
+// BootSectorVolumeLabel returns the BS_VolLab copy of the label, which is what
+// the boot sector claims rather than what the volume is called. A difference
+// between this and VolumeLabel is itself evidence: it means the volume was
+// labelled after it was formatted.
+func (v *Volume) BootSectorVolumeLabel() string {
+	return v.volumeLabel
+}
+
+// VolumeLabelSource reports where VolumeLabel's answer came from: "root
+// directory", "boot sector", or "" when the volume carries no label at all.
+func (v *Volume) VolumeLabelSource() string {
+	switch {
+	case v.rootVolumeLabel != "":
+		return "root directory"
+	case v.volumeLabel != "":
+		return "boot sector"
+	default:
+		return ""
+	}
 }
 
 func (v *Volume) RootCluster() uint32 {

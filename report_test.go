@@ -407,8 +407,10 @@ func TestReportJSONKeysAreSnakeCase(t *testing.T) {
 	}
 
 	wantMeta := []string{
-		"block_size", "cluster_count", "fat_mirror_mismatches", "offset",
-		"sector_size", "type", "used_backup_boot_sector", "volume_label", "volume_serial",
+		"block_size", "boot_sector_volume_label", "cluster_count",
+		"fat_mirror_mismatches", "offset", "sector_size", "type",
+		"used_backup_boot_sector", "volume_label", "volume_label_source",
+		"volume_serial",
 	}
 	sort.Strings(wantMeta)
 	if got := keysOf(t, decoded["fat_meta"].(map[string]any)); !equalStrings(got, wantMeta) {

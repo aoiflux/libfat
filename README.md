@@ -338,3 +338,46 @@ go vet ./...
 # inside the volume.
 go test -run XXX -fuzz '^FuzzFragmentOffsets$' -fuzztime 60s .
 ```
+
+### Integration tests
+
+The suite above builds its own images, which keeps it fast and lets it construct
+damage on purpose, but cannot catch an assumption this library and its fixture
+builder share. `integration_test.go` runs the same checks against volumes
+written by `mkfs.fat` and by Windows, including a FAT32 partition inside a GPT
+disk. They skip unless told where the images are:
+
+```bash
+LIBFAT_TEST_IMAGES=/path/to/images go test -run TestReal -v .
+```
+
+`integration_oracle_test.go` goes further and compares libfat's reading against
+one made by 7-Zip, whose FAT handler shares no code with this library, which is
+the only way to catch a misreading that libfat makes consistently. Generate the
+oracle once per image:
+
+```bash
+python3 testdata/make_fat_oracle.py /path/to/images/disk.dd
+```
+
+`realVolumes` in `integration_test.go` lists the images expected, along with
+geometry decoded outside this library. A volume that is present but does not
+match its entry is skipped rather than failed, since that is a fact about the
+image rather than about libfat.
+
+### The synthetic corpus
+
+Real images are the better evidence, but the three on hand cover one sector size,
+two of the three FAT types, no deletions, no orphans and no fragmented regular
+file. `testdata/gen_corpus.sh` builds fourteen volumes that cover the rest, using
+`dosfstools` and `mtools` — neither of which needs root, and neither of which
+shares any code with libfat:
+
+```bash
+wsl.exe -- sh testdata/gen_corpus.sh /mnt/e/dataset/fat_synth
+```
+
+`corpus_test.go` reads them from `$LIBFAT_TEST_IMAGES/fat_synth`, or from
+`LIBFAT_CORPUS`. Each volume's manifest entry records what only that volume
+covers, and the generated `README.md` beside the images explains each one and
+what the corpus still does not reach.

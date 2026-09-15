@@ -8,8 +8,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 ## [Unreleased]
 
 The Go API is additive: no exported symbol was removed, renamed, or
-re-signatured, and no existing JSON key changed its name or meaning. Reports
-gain keys, which a consumer that ignores unknown keys is unaffected by.
+re-signatured, and no JSON key was removed or renamed. Reports gain keys, which
+a consumer that ignores unknown keys is unaffected by.
+
+One existing value changes. `Volume.VolumeLabel()`, and the report's
+`volume_label`, now read the volume's label from the root directory rather than
+from the boot sector, which is a fix rather than an addition and is described
+under *Fixed*.
 
 ### Added
 
@@ -52,6 +57,12 @@ gain keys, which a consumer that ignores unknown keys is unaffected by.
   sibling libxfat report's key) and `Name` (the basename, which the report could
   not previously express). `Filename` is unchanged and still carries the full
   path; it is retained because removing it would break existing consumers.
+- **Volume label provenance.** `Volume.BootSectorVolumeLabel()` returns the boot
+  sector's copy of the label on its own, and `Volume.VolumeLabelSource()` says
+  which of the two copies `VolumeLabel()` used. `FATMeta` carries both as
+  `boot_sector_volume_label` and `volume_label_source`. A disagreement between
+  them is evidence in itself: it means the volume was labelled after it was
+  formatted.
 
 ### Changed
 
@@ -63,7 +74,61 @@ gain keys, which a consumer that ignores unknown keys is unaffected by.
 
 ### Fixed
 
+- **The wrong volume label was reported.** FAT records a label twice - in the
+  boot sector's `BS_VolLab` field and as a record in the root directory carrying
+  the volume-ID attribute - and only the second is authoritative. libfat read
+  the first. Because the boot sector's copy is written once at format time and
+  never updated, and because Windows leaves it reading `NO NAME` whatever the
+  volume is called, libfat reported names that no operating system and no other
+  tool would show. It was found by cross-checking a real Windows-formatted FAT32
+  partition against 7-Zip, which read its label as `P3_FAT32` where libfat said
+  `NO NAME`.
+
+  `VolumeLabel()` now prefers the root directory's record and falls back to the
+  boot sector's copy when there is none. The root is scanned once at open,
+  bounded, and a failure to read it is not an error: the boot sector's copy is
+  used instead. Consumers that compare `volume_label` across reports written
+  before and after this change will see a difference on affected volumes without
+  the volume having changed.
 - `constants.go` had no trailing newline, the only `gofmt` deviation in the tree.
+
+### Tests
+
+- **Integration tests against real images.** `integration_test.go` and
+  `integration_oracle_test.go` run against FAT12, FAT16 and FAT32 volumes written
+  by `mkfs.fat` and by Windows, including a FAT32 partition sitting 2 GB inside a
+  GPT disk - the case `BaseOffset` exists for, previously covered only by
+  fixtures this package builds itself. They are skipped unless
+  `LIBFAT_TEST_IMAGES` names a directory holding the images.
+- Every entry on each volume is checked, not a sample: the `Range` invariants,
+  that each entry's 32-byte record really sits at its reported
+  `EntryAbsoluteOffset` and inside its parent directory's runs, and that each
+  run's bytes in the image are the file's bytes at that run's position. An
+  earlier sampling rule spent its budget on a few large files and walked past
+  every fragmented entry on all three images, so the fragmented counts are now
+  pinned in the manifest.
+- `testdata/make_fat_oracle.py` generates an independent oracle with 7-Zip, whose
+  FAT handler shares no code with libfat. Cross-checking against it confirmed
+  agreement on every path, size and 8.3 short name, on 795 MB of file content,
+  and on 3,724 modification timestamps - and is what surfaced the volume label
+  defect above.
+- **A synthetic corpus.** `testdata/gen_corpus.sh` builds fourteen volumes with
+  `dosfstools` and `mtools`, covering what the real images cannot: FAT12 at all,
+  a 4096-byte and a 1024-byte sector, a 1024-entry root region, a single-FAT
+  volume, deletions on each of the three FAT types, a fragmented *regular* file,
+  an orphaned directory, disagreeing FATs, a destroyed primary boot sector, and
+  a boot sector label that contradicts the root directory's. Neither tool needs
+  root, and mtools edits an image in place rather than mounting it, so the whole
+  corpus builds under WSL.
+- `corpus_test.go` pins what each volume covers and cross-checks thirteen of the
+  fourteen against 7-Zip. The fourteenth has no oracle because 7-Zip cannot open
+  a volume whose primary boot sector is destroyed, while libfat reads it through
+  the backup.
+- `TestCorpusRecoversDeletedContent` is the claim this library exists to make,
+  checked end to end: a file whose record is deleted and whose FAT chain has been
+  released reads back byte for byte under `FragmentOptions.AssumeContiguous`,
+  against the sha256 of what the generator deleted. Two of the three deleted
+  files per volume also have their long names recovered from the orphaned slots.
 
 ### Note for the sibling libxfat
 
