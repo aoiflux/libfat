@@ -5,6 +5,73 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The Go API is additive: no exported symbol was removed, renamed, or
+re-signatured, and no existing JSON key changed its name or meaning. Reports
+gain keys, which a consumer that ignores unknown keys is unaffected by.
+
+### Added
+
+- **Configurable base offset.** `OpenOptions.BaseOffset` states where the volume
+  begins inside the reader, and `Volume.BaseOffset()` reports it back. Every
+  offset the library returns - `Range.StartByte`, `DirEntry.EntryAbsoluteOffset`,
+  `DirEntry.LFNEntryOffset`, `BootSector.Offset`, `FATReport.StartOffset` and
+  `EndOffset`, `FATMeta.Offset` and every report fragment - now includes it, so
+  a volume opened at a partition offset yields whole-disk offsets directly.
+- Previously the only way to open a partition was to scope the reader with an
+  `io.SectionReader`, which silently yielded partition-relative offsets.
+  Comparing those against whole-disk byte ranges produces a confident wrong
+  answer rather than an error, which is the failure this field removes. Both
+  approaches remain valid; mixing them double-counts the base, and the package
+  documentation now says so.
+- A negative `BaseOffset`, or one large enough that the end of the volume would
+  overflow an `int64`, is rejected at open with the new `ErrInvalidBaseOffset`.
+  The zero value reproduces the previous behaviour exactly.
+- **File-relative offsets on runs.** `Range.FileOffset` (`file_offset`) is where
+  a run begins in the file's own byte space, so mapping a changed image range
+  back to a position in the file no longer requires the caller to accumulate
+  lengths themselves. `Coalesce` renumbers the runs it returns.
+- `Range`'s documentation now states its semantics in full: offsets are
+  image-absolute, `Length` excludes cluster slack, holes do not occur, adjacent
+  runs are coalesced, and the slice is sorted and gap-free.
+- **Capability introspection.** `Capabilities` and `Volume.Capabilities()` report
+  what FAT records as distinct from what a given volume happens to record, so a
+  consumer can tell "the format does not keep that" from "that was absent here".
+  `SubSecondTimestamps` is true, and its documentation carries the granularities
+  that matter: creation to 10 ms, modification to 2 s, last access to the day.
+  Timestamp equality is therefore not proof that nothing changed on FAT.
+- `SecondFAT`, `FSInfoSector` and `BackupBootSector` are read from the volume's
+  own boot record rather than being format constants.
+- **Report provenance.** `FATReport` gains `SchemaVersion` (`schema_version`,
+  currently `1`, exposed as `ReportSchemaVersion`), `LibraryVersion` and
+  `Generated`. `Generated` is wall-clock time and is the only field that differs
+  between two reports of an unchanged volume, so a consumer hashing a report to
+  detect change must exclude it.
+- **Paths on report rows.** `FATFile` gains `Path` (the full path, matching the
+  sibling libxfat report's key) and `Name` (the basename, which the report could
+  not previously express). `Filename` is unchanged and still carries the full
+  path; it is retained because removing it would break existing consumers.
+
+### Changed
+
+- `FATReport.StartOffset` is now the volume's base rather than always zero, and
+  `EndOffset` is the base plus the volume size. On a volume opened without a
+  base offset both are unchanged.
+- The package documentation and the `fragments` example no longer add the
+  partition base to reported offsets by hand; the example uses `BaseOffset`.
+
+### Fixed
+
+- `constants.go` had no trailing newline, the only `gofmt` deviation in the tree.
+
+### Note for the sibling libxfat
+
+`libfat.Range` and `libxfat.Range` are deliberately identical field for field.
+This release adds `FileOffset` to libfat's; libxfat needs the same field, with
+the same name, the same `json:"file_offset"` tag and the same meaning, populated
+by its `FragmentOffsets`. Until that lands the two types differ by one field.
+
 ## [0.3.0] - Unreleased
 
 The Go API is additive: no exported symbol was removed, renamed, or

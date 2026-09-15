@@ -17,6 +17,11 @@ var (
 	ErrIsDirectory       = errors.New("is a directory")
 	ErrCorruptStructure  = errors.New("corrupt filesystem structure")
 
+	// ErrInvalidBaseOffset reports an OpenOptions.BaseOffset that cannot
+	// describe a position in an image: a negative value, or one so large that
+	// adding the volume's size to it would overflow an int64.
+	ErrInvalidBaseOffset = errors.New("invalid base offset")
+
 	// ErrTruncatedChain reports that a cluster chain covered fewer bytes than
 	// the directory entry's recorded size. This is the normal outcome for
 	// deleted entries whose FAT entries have been freed: the chain walk stops

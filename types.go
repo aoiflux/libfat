@@ -57,6 +57,25 @@ type OpenOptions struct {
 	// recover the lost first character. It is off by default because enabling
 	// it changes the Name of deleted entries.
 	RecoverDeletedLongNames bool `json:"recover_deleted_long_names"`
+
+	// BaseOffset is the byte offset within the reader at which the volume's
+	// boot sector begins.
+	//
+	// Every offset this library reports already includes it - a Range.StartByte,
+	// a DirEntry.EntryAbsoluteOffset, a DirEntry.LFNEntryOffset, a BootSector
+	// .Offset, a report fragment - so those values address the image the volume
+	// was opened over directly, with no further adjustment by the caller.
+	//
+	// Use 0 when the reader is already scoped to the volume, for example an
+	// io.SectionReader over a single partition. Set it to the partition's start
+	// when the reader is the whole disk and you need whole-disk offsets, which
+	// is what intersecting against externally supplied byte ranges requires: a
+	// partition-relative offset compared against a whole-disk range produces a
+	// confident wrong answer rather than an error.
+	//
+	// It must not be negative. The zero value reproduces the behaviour of every
+	// release before v0.4.0 exactly.
+	BaseOffset int64 `json:"base_offset"`
 }
 
 // NameSource records how a DirEntry's Name was determined.

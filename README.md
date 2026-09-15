@@ -182,9 +182,20 @@ Consecutive clusters are coalesced, so one `Range` means the file is contiguous
 and more than one means it is fragmented. Ranges sum to the entry's size; the
 unused tail of the final cluster is reported separately by `SlackRange`.
 
-Offsets are relative to the `io.ReaderAt` passed to `Open`. For a partition
-inside a whole-disk image, layer an `io.SectionReader` at the partition offset
-and add that base to obtain whole-disk coordinates.
+Offsets are absolute within the `io.ReaderAt` passed to `Open`, and include
+`OpenOptions.BaseOffset`. For a partition inside a whole-disk image, either open
+the whole image and set `BaseOffset` to the partition start, which makes every
+reported offset a whole-disk offset:
+
+```go
+v, err := libfat.OpenWithOptions(image, libfat.OpenOptions{
+	BaseOffset: partitionOffset,
+})
+```
+
+or layer an `io.SectionReader` at the partition offset and leave `BaseOffset` at
+zero, which gives partition-relative offsets. Do one or the other: adding the
+partition base to an offset that already includes it counts it twice.
 
 ### Deleted files
 
@@ -240,6 +251,10 @@ Volume-level:
 - `(*Volume).OpenEntry(entry DirEntry) (*File, error)` — the route to deleted
   and orphaned entries, which no path resolves to
 - `(*Volume).GetBootSector() *BootSector`
+- `(*Volume).BaseOffset() int64` — where the volume begins in the image, which
+  every reported offset includes
+- `(*Volume).Capabilities() Capabilities` — what FAT records, as distinct from
+  what this volume happens to record
 
 Walking the tree:
 
@@ -259,6 +274,8 @@ Reports:
   `WriteReportWithOptions`, `WriteReportWithOptionsContext`
 - `(*FATReport).Summary()`, `FilterFiles`, `FilesByType`, `DeletedFiles`,
   `OrphanedFiles`, `FragmentedFiles`, `AssumedFiles`
+- `FATReport` carries `SchemaVersion` (`ReportSchemaVersion`), `LibraryVersion`
+  and `Generated`; rows carry `Path` and `Name` alongside `Filename`
 
 Fragments and offsets:
 

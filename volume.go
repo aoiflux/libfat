@@ -13,6 +13,7 @@ import (
 
 type Volume struct {
 	reader                    io.ReaderAt
+	baseOffset                int64
 	forcedFATType             string
 	includeVolumeLabelEntries bool
 	includeVirtualRootEntries bool
@@ -62,6 +63,9 @@ func OpenWithOptions(reader io.ReaderAt, options OpenOptions) (*Volume, error) {
 	if fatType != "" && fatType != FATType12 && fatType != FATType16 && fatType != FATType32 {
 		return nil, wrapVolumeError("open", fmt.Errorf("%w: %s", ErrUnsupportedFAT, fatType))
 	}
+	if options.BaseOffset < 0 {
+		return nil, wrapVolumeError("open", fmt.Errorf("%w: %d", ErrInvalidBaseOffset, options.BaseOffset))
+	}
 
 	type statReader interface {
 		Stat() (fs.FileInfo, error)
@@ -74,6 +78,7 @@ func OpenWithOptions(reader io.ReaderAt, options OpenOptions) (*Volume, error) {
 
 	v := &Volume{
 		reader:                    reader,
+		baseOffset:                options.BaseOffset,
 		forcedFATType:             fatType,
 		includeVolumeLabelEntries: options.IncludeVolumeLabelEntries,
 		includeVirtualRootEntries: options.IncludeVirtualRootEntries,
@@ -123,13 +128,20 @@ func (v *Volume) parseBootSector() error {
 	return fmt.Errorf("%w: no usable boot sector found", ErrInvalidBootSector)
 }
 
+// parseBootSectorAt parses the boot sector at offset, which is relative to the
+// start of the volume: the caller passes the primary and backup candidates as
+// the sector indices the format defines them as, and this rebases them onto the
+// image. The parsed BootSector.Offset is image-absolute, like every other
+// offset this library reports, while UsedBackup stays a statement about which
+// of the volume's own candidates was read.
 func (v *Volume) parseBootSectorAt(offset int64) (*BootSector, error) {
+	imageOffset := v.abs(offset)
 	buf := make([]byte, BootSectorSize)
-	if _, err := v.reader.ReadAt(buf, offset); err != nil {
-		return nil, wrapParseError("boot sector", offset, err)
+	if _, err := v.reader.ReadAt(buf, imageOffset); err != nil {
+		return nil, wrapParseError("boot sector", imageOffset, err)
 	}
 
-	bs := &BootSector{Offset: offset, UsedBackup: offset != 0}
+	bs := &BootSector{Offset: imageOffset, UsedBackup: offset != 0}
 	copy(bs.Jump[:], buf[0:3])
 	copy(bs.OEMName[:], buf[3:11])
 	bs.BytesPerSector = ReadUint16LE(buf, 11)
@@ -200,6 +212,16 @@ func (v *Volume) applyBootSector(bs *BootSector) error {
 	totalSectors := uint32(bs.TotalSectors16)
 	if totalSectors == 0 {
 		totalSectors = bs.TotalSectors32
+	}
+
+	// The volume's extent has to be expressible as image offsets, since that is
+	// what every offset this library reports is. Checked here rather than at
+	// open because the volume's size is not known until the boot sector is, and
+	// as early as it is known so that every rebased read below is covered.
+	volumeSize := uint64(totalSectors) * uint64(bs.BytesPerSector)
+	if volumeSize > uint64(math.MaxInt64)-uint64(v.baseOffset) {
+		return fmt.Errorf("%w: base offset %d places the end of a %d-byte volume beyond the addressable range",
+			ErrInvalidBaseOffset, v.baseOffset, volumeSize)
 	}
 
 	fatSize := uint32(bs.FATSize16)
@@ -306,7 +328,7 @@ func (v *Volume) applyBootSector(bs *BootSector) error {
 	v.rootDirFirstSector = rootDirFirstSector
 	v.rootCluster = rootCluster
 	v.clusterCount = clusterCount
-	v.volumeSize = uint64(totalSectors) * uint64(bs.BytesPerSector)
+	v.volumeSize = volumeSize
 	v.volumeLabel = bs.VolumeLabel
 	v.fsTypeHint = bs.FileSystemTypeHint
 
@@ -385,6 +407,34 @@ func (v *Volume) FirstRootDirSector() uint32 {
 	return v.rootDirFirstSector
 }
 
+// BaseOffset is the byte offset within the image at which this volume begins.
+//
+// It is what every offset this library returns is measured from - a Range's
+// StartByte, a DirEntry's EntryAbsoluteOffset and LFNEntryOffset, the report's
+// StartOffset and every fragment in it - so those values can be read straight
+// from the image the volume was opened over, with no further adjustment.
+// Subtract it to obtain a volume-relative offset.
+//
+// It is OpenOptions.BaseOffset as supplied, and 0 unless one was given.
+func (v *Volume) BaseOffset() int64 {
+	return v.baseOffset
+}
+
+// abs converts a volume-relative byte offset into an image-absolute one.
+// Internal geometry is held relative to the volume, because that is what the
+// boot sector describes and what the bounds checks are expressed in; every
+// offset that leaves this package or reaches the reader goes through here.
+func (v *Volume) abs(rel int64) int64 {
+	return rel + v.baseOffset
+}
+
+// endOffset is the image-absolute offset one past the volume's last byte. It is
+// the bound to test an already-absolute offset against, where a volume-relative
+// one would be tested against volumeSize.
+func (v *Volume) endOffset() int64 {
+	return v.baseOffset + int64(v.volumeSize)
+}
+
 func (v *Volume) ClusterToOffset(cluster uint32) (int64, error) {
 	if v.IsClosed() {
 		return 0, ErrVolumeClosed
@@ -401,9 +451,14 @@ func (v *Volume) clusterToOffset(cluster uint32) (int64, error) {
 	if offset+uint64(v.bytesPerCluster) > v.volumeSize || offset > uint64(math.MaxInt64) {
 		return 0, fmt.Errorf("%w: cluster %d extends beyond volume", ErrCorruptStructure, cluster)
 	}
-	return int64(offset), nil
+	return v.abs(int64(offset)), nil
 }
 
+// ReadAt reads from the image the volume was opened over. The offset is
+// image-absolute, in the same coordinate space as BaseOffset and every offset
+// this library reports, so a Range's StartByte can be passed here unchanged.
+// It is not volume-relative: a volume opened with a non-zero BaseOffset does
+// not begin at offset 0 here.
 func (v *Volume) ReadAt(p []byte, offset int64) (int, error) {
 	if v.IsClosed() {
 		return 0, ErrVolumeClosed
@@ -417,7 +472,7 @@ func (v *Volume) readSectors(firstSector, sectorCount uint32) ([]byte, error) {
 	}
 	size := int(sectorCount * v.bytesPerSector)
 	buf := make([]byte, size)
-	offset := int64(firstSector) * int64(v.bytesPerSector)
+	offset := v.abs(int64(firstSector) * int64(v.bytesPerSector))
 	if _, err := v.ReadAt(buf, offset); err != nil && err != io.EOF {
 		return nil, wrapParseError("sector data", offset, err)
 	}
@@ -498,7 +553,7 @@ func (v *Volume) readFATEntryFromTable(cluster, table uint32) (uint32, error) {
 
 	buf := make([]byte, entrySize)
 	fatStartSector := v.firstFATSector + (table * v.fatSizeSectors)
-	fatOffset := (int64(fatStartSector) * int64(v.bytesPerSector)) + int64(entryOffset)
+	fatOffset := v.abs((int64(fatStartSector) * int64(v.bytesPerSector)) + int64(entryOffset))
 	n, err := v.ReadAt(buf, fatOffset)
 	if err != nil && err != io.EOF {
 		return 0, wrapParseError("FAT entry", fatOffset, err)
@@ -655,7 +710,7 @@ func (v *Volume) readFAT32FSInfo(bs *BootSector) (*FAT32FSInfo, error) {
 		return nil, fmt.Errorf("%w: invalid sector size for FSInfo", ErrCorruptStructure)
 	}
 	buf := make([]byte, sectorSize)
-	offset := int64(sector) * sectorSize
+	offset := v.abs(int64(sector) * sectorSize)
 	if _, err := v.reader.ReadAt(buf, offset); err != nil && err != io.EOF {
 		return nil, wrapParseError("FAT32 FSInfo", offset, err)
 	}

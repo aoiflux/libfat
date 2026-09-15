@@ -397,7 +397,10 @@ func TestReportJSONKeysAreSnakeCase(t *testing.T) {
 
 	decoded := decodeReport(t, mustReport(t, v, "image.img", ReportOptions{}))
 
-	wantTop := []string{"fat_meta", "files", "name", "start_offset", "end_offset"}
+	wantTop := []string{
+		"fat_meta", "files", "name", "start_offset", "end_offset",
+		"schema_version", "library_version", "generated",
+	}
 	sort.Strings(wantTop)
 	if got := keysOf(t, decoded); !equalStrings(got, wantTop) {
 		t.Fatalf("top-level keys = %v, want %v", got, wantTop)
@@ -415,8 +418,8 @@ func TestReportJSONKeysAreSnakeCase(t *testing.T) {
 	wantRow := []string{
 		"attributes", "cluster_allocated", "entry_absolute_offset", "entry_slot_index",
 		"filename", "first_cluster", "fragments", "is_deleted", "is_fragmented",
-		"is_orphaned", "is_virtual", "layout", "lfn_entry_offset", "name_source",
-		"parent_first_cluster", "short_name", "size", "timestamps", "type",
+		"is_orphaned", "is_virtual", "layout", "lfn_entry_offset", "name", "name_source",
+		"parent_first_cluster", "path", "short_name", "size", "timestamps", "type",
 	}
 	sort.Strings(wantRow)
 	files := decoded["files"].([]any)
@@ -752,7 +755,7 @@ func TestRangeAndFragmentResultJSONTags(t *testing.T) {
 	if err := json.Unmarshal(raw, &r); err != nil {
 		t.Fatalf("json.Unmarshal failed: %v", err)
 	}
-	wantRange := []string{"cluster_count", "length", "sparse", "start_byte", "start_cluster"}
+	wantRange := []string{"cluster_count", "file_offset", "length", "sparse", "start_byte", "start_cluster"}
 	if got := keysOf(t, r); !equalStrings(got, wantRange) {
 		t.Fatalf("Range keys = %v, want %v", got, wantRange)
 	}

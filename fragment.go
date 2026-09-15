@@ -6,16 +6,42 @@ import (
 	"sort"
 )
 
-// Range is one contiguous run of bytes in the image passed to Open.
+// Range is one contiguous run of bytes in the image passed to Open. Ranges are
+// the unit that lets a caller work out which bytes of an image a file occupies
+// without re-walking the FAT.
 //
-// StartByte is an absolute offset in that io.ReaderAt. When the reader is an
-// io.SectionReader positioned at a partition offset, StartByte is relative to
-// the partition, and the caller adds the partition base to obtain a whole-disk
-// offset. Ranges are the unit that lets a caller compute image byte ranges for
-// a file without re-walking the FAT.
+// The semantics an adapter needs, stated once:
+//
+//   - StartByte is absolute within the io.ReaderAt the volume was opened over,
+//     and already includes OpenOptions.BaseOffset. A volume opened at a
+//     partition offset therefore needs no adjustment before its ranges are
+//     compared against whole-disk byte ranges.
+//   - Length counts only the file's own bytes. The final run is trimmed to the
+//     entry's recorded size, so the ranges sum to that size and never include
+//     the slack at the end of the last cluster; that slack is SlackRange.
+//   - Holes do not occur. FAT has no sparse allocation, so no run is elided and
+//     Sparse is always false - see the field comment.
+//   - Adjacent runs are coalesced, so a contiguous file yields exactly one
+//     Range and len(ranges) > 1 is what fragmentation means here.
+//   - The slice is sorted by FileOffset and is gap-free: each run begins where
+//     the one before it ended in the file's byte space.
+//
+// A Range whose provenance matters should be obtained from
+// FragmentOffsetsWithOptions, which reports how the runs were derived rather
+// than only what they are.
 type Range struct {
-	// StartByte is the absolute byte offset of the run within the volume.
+	// StartByte is the byte offset of the run within the image, including
+	// OpenOptions.BaseOffset.
 	StartByte int64 `json:"start_byte"`
+	// FileOffset is where the run begins within the file's own byte space: 0
+	// for the first run, and the sum of every preceding run's Length after
+	// that. It is what maps a changed image range back to a position inside
+	// the file, and it is reported rather than left to the caller because
+	// deriving it means knowing that no run is ever elided.
+	//
+	// For the Range returned by SlackRange it is the entry's size, slack being
+	// what follows the file's last byte.
+	FileOffset int64 `json:"file_offset"`
 	// Length is the number of bytes in the run.
 	Length int64 `json:"length"`
 	// Sparse is always false on FAT: the format has no sparse allocation and
@@ -123,6 +149,20 @@ func (v *Volume) FragmentOffsets(entry DirEntry) ([]Range, error) {
 // be produced at all; every partial or degraded outcome is reported through
 // FragmentResult's flags with the usable ranges intact.
 func (v *Volume) FragmentOffsetsWithOptions(entry DirEntry, opts FragmentOptions) (*FragmentResult, error) {
+	result, err := v.fragmentOffsets(entry, opts)
+	if err != nil {
+		return nil, err
+	}
+	assignFileOffsets(result.Ranges)
+	return result, nil
+}
+
+// fragmentOffsets is FragmentOffsetsWithOptions without the FileOffset pass.
+// It is split out so that the several ways a result can be arrived at - a
+// walked chain, a deleted entry's single defensible cluster, a contiguity
+// assumption substituted for a truncated walk - all leave through one place
+// that can number the runs.
+func (v *Volume) fragmentOffsets(entry DirEntry, opts FragmentOptions) (*FragmentResult, error) {
 	if v.IsClosed() {
 		return nil, ErrVolumeClosed
 	}
@@ -268,6 +308,7 @@ func (v *Volume) ClusterChainFragments(startCluster uint32, size uint64) ([]Rang
 		return nil, err
 	}
 	v.finalizeRuns(result, int64(size))
+	assignFileOffsets(result.Ranges)
 	if result.Truncated {
 		return result.Ranges, fmt.Errorf("%w: %d of %d bytes from cluster %d",
 			ErrTruncatedChain, result.BytesCovered, size, startCluster)
@@ -289,12 +330,12 @@ func (v *Volume) RootDirectoryFragments() ([]Range, error) {
 		return v.ClusterChainFragments(v.rootCluster, 0)
 	}
 
-	offset := int64(v.rootDirFirstSector) * int64(v.bytesPerSector)
+	offset := v.abs(int64(v.rootDirFirstSector) * int64(v.bytesPerSector))
 	length := int64(v.rootDirSectors) * int64(v.bytesPerSector)
 	if length == 0 {
 		return nil, nil
 	}
-	if uint64(offset)+uint64(length) > v.volumeSize {
+	if offset+length > v.endOffset() {
 		return nil, fmt.Errorf("%w: root directory region extends beyond volume", ErrCorruptStructure)
 	}
 	return []Range{{StartByte: offset, Length: length}}, nil
@@ -474,11 +515,12 @@ func (v *Volume) SlackRange(entry DirEntry) (Range, bool, error) {
 	}
 	slackStart := last.EndByte()
 	slackLen := perCluster - used
-	if uint64(slackStart)+uint64(slackLen) > v.volumeSize {
+	if slackStart+slackLen > v.endOffset() {
 		return Range{}, false, nil
 	}
 	return Range{
 		StartByte:    slackStart,
+		FileOffset:   int64(entry.Size),
 		Length:       slackLen,
 		StartCluster: last.StartCluster + last.ClusterCount - 1,
 		ClusterCount: 1,
@@ -527,11 +569,32 @@ func IsFragmented(ranges []Range) bool {
 	return len(Coalesce(ranges)) > 1
 }
 
+// assignFileOffsets numbers runs by their position in the file's byte space,
+// in place. The slice must already be in file order, which every producer in
+// this package guarantees.
+//
+// Sparse runs are counted like any other, because on FAT there are none: were
+// a hole ever elided instead of reported, the running sum would silently stop
+// describing the file. That is the detail this function exists to stop each
+// caller from having to get right.
+func assignFileOffsets(ranges []Range) {
+	var at int64
+	for i := range ranges {
+		ranges[i].FileOffset = at
+		at += ranges[i].Length
+	}
+}
+
 // Coalesce merges runs that are adjacent in the image into single runs. Ranges
 // returned by this package are coalesced already; the function is exported for
 // callers that assemble range lists from other sources.
+//
+// The returned runs are renumbered, so FileOffset describes the merged slice
+// rather than the input. That assumes the input was in file order and gap-free,
+// which is what merging adjacent runs means in the first place.
 func Coalesce(ranges []Range) []Range {
 	if len(ranges) < 2 {
+		assignFileOffsets(ranges)
 		return ranges
 	}
 	merged := make([]Range, 0, len(ranges))
@@ -545,5 +608,7 @@ func Coalesce(ranges []Range) []Range {
 		merged = append(merged, current)
 		current = next
 	}
-	return append(merged, current)
+	merged = append(merged, current)
+	assignFileOffsets(merged)
+	return merged
 }

@@ -1,14 +1,35 @@
 // Package libfat provides read-only, panic-free parsing of FAT12, FAT16, and
 // FAT32 volumes and disk images for forensic use.
 //
-// A volume is opened over an io.ReaderAt, so a partition inside a whole-disk
-// image is handled by layering an io.SectionReader at the partition offset:
+// A volume is opened over an io.ReaderAt. All byte offsets the package returns
+// are absolute within that reader, and already include OpenOptions.BaseOffset.
+//
+// # Partitions and coordinate spaces
+//
+// A partition inside a whole-disk image can be opened either way round, and the
+// choice decides what coordinate space every reported offset is in.
+//
+// To work in whole-disk coordinates - which is what comparing against byte
+// ranges obtained from somewhere else requires - open the whole image and say
+// where the volume starts:
+//
+//	v, err := libfat.OpenWithOptions(image, libfat.OpenOptions{
+//		BaseOffset: partitionOffset,
+//	})
+//
+// Every offset then addresses the whole disk, so no adjustment is needed and
+// none must be applied.
+//
+// To work in partition-relative coordinates, scope the reader instead and leave
+// BaseOffset at zero:
 //
 //	section := io.NewSectionReader(image, partitionOffset, partitionLength)
 //	v, err := libfat.Open(section)
 //
-// All byte offsets the package returns are relative to that reader. To obtain
-// whole-disk offsets, add the partition base.
+// Both are correct; mixing them is not. Adding partitionOffset to an offset
+// that already includes BaseOffset counts it twice, and comparing a
+// partition-relative offset against a whole-disk range produces a confident
+// wrong answer rather than an error, which is why BaseOffset exists.
 //
 // # Locating file data
 //

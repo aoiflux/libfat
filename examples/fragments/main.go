@@ -12,7 +12,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 
@@ -50,16 +49,13 @@ func run(path string, base int64) error {
 	}
 	defer file.Close()
 
-	info, err := file.Stat()
-	if err != nil {
-		return err
-	}
-
-	// Layering a SectionReader at the partition offset is how a volume inside a
-	// whole-disk image is opened. Every offset the library reports is then
-	// relative to the partition, so add base for whole-disk coordinates.
-	section := io.NewSectionReader(file, base, info.Size()-base)
-	v, err := libfat.OpenWithOptions(section, libfat.OpenOptions{
+	// BaseOffset tells the library where the volume starts inside the image, so
+	// every offset it reports is a whole-disk offset. The alternative is to
+	// scope the reader with an io.SectionReader and leave BaseOffset at zero,
+	// which yields partition-relative offsets instead. Do one or the other:
+	// adding base to an offset that already includes it counts it twice.
+	v, err := libfat.OpenWithOptions(file, libfat.OpenOptions{
+		BaseOffset: base,
 		// Reconstructing long names for deleted entries is what makes a
 		// deleted-file listing readable, so a forensic tool wants it on.
 		RecoverDeletedLongNames: true,
@@ -76,15 +72,15 @@ func run(path string, base int64) error {
 	if err != nil {
 		return err
 	}
-	if err := walk(v, root, base); err != nil {
+	if err := walk(v, root); err != nil {
 		return err
 	}
-	return reportOrphans(v, base)
+	return reportOrphans(v)
 }
 
 // reportOrphans lists entries that no path leads to, recovered by scanning the
 // data area for directory clusters the root tree cannot reach.
-func reportOrphans(v *libfat.Volume, base int64) error {
+func reportOrphans(v *libfat.Volume) error {
 	result, err := v.ScanOrphans(libfat.OrphanScanOptions{})
 	if err != nil {
 		return err
@@ -109,7 +105,7 @@ func reportOrphans(v *libfat.Volume, base int64) error {
 		fmt.Printf("  directory at cluster %d (%s), parent cluster %d\n",
 			dir.FirstCluster, confidence, dir.ParentCluster)
 		for _, r := range dir.Ranges {
-			fmt.Printf("    data: image offset %d-%d\n", base+r.StartByte, base+r.EndByte())
+			fmt.Printf("    data: image offset %d-%d\n", r.StartByte, r.EndByte())
 		}
 		for _, entry := range dir.Entries {
 			state := ""
@@ -117,14 +113,14 @@ func reportOrphans(v *libfat.Volume, base int64) error {
 				state = " [deleted]"
 			}
 			fmt.Printf("    %-32s %8d bytes  entry at %d%s\n",
-				entry.Name, entry.Size, base+entry.EntryAbsoluteOffset, state)
+				entry.Name, entry.Size, entry.EntryAbsoluteOffset, state)
 		}
 		fmt.Println()
 	}
 	return nil
 }
 
-func walk(v *libfat.Volume, dir *libfat.File, base int64) error {
+func walk(v *libfat.Volume, dir *libfat.File) error {
 	entries, err := dir.ReadDir()
 	if err != nil {
 		return err
@@ -143,18 +139,18 @@ func walk(v *libfat.Volume, dir *libfat.File, base int64) error {
 			if err != nil {
 				continue
 			}
-			if err := walk(v, sub, base); err != nil {
+			if err := walk(v, sub); err != nil {
 				return err
 			}
 			continue
 		}
 
-		report(v, entry, base)
+		report(v, entry)
 	}
 	return nil
 }
 
-func report(v *libfat.Volume, entry libfat.DirEntry, base int64) {
+func report(v *libfat.Volume, entry libfat.DirEntry) {
 	// Deleted files have no FAT chain left, so ask for the contiguity-based
 	// reconstruction and label it as such in the output.
 	opts := libfat.FragmentOptions{AssumeContiguous: entry.Deleted}
@@ -191,12 +187,12 @@ func report(v *libfat.Volume, entry libfat.DirEntry, base int64) {
 
 	for i, r := range result.Ranges {
 		fmt.Printf("    run %d: image offset %d-%d (%d bytes, clusters %d+%d)\n",
-			i, base+r.StartByte, base+r.EndByte(), r.Length, r.StartCluster, r.ClusterCount)
+			i, r.StartByte, r.EndByte(), r.Length, r.StartCluster, r.ClusterCount)
 	}
 
 	if slack, ok, err := v.SlackRange(entry); err == nil && ok {
 		fmt.Printf("    slack: image offset %d-%d (%d bytes)\n",
-			base+slack.StartByte, base+slack.EndByte(), slack.Length)
+			slack.StartByte, slack.EndByte(), slack.Length)
 	}
 	fmt.Println()
 }

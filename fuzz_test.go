@@ -379,3 +379,67 @@ func FuzzReport(f *testing.F) {
 		}
 	})
 }
+
+// FuzzOpenWithBaseOffset exercises the offset rebasing added for BaseOffset
+// against malformed geometry. The arithmetic that makes a reported offset
+// image-absolute runs on numbers read from the boot sector, so a torn one must
+// still produce an error rather than a panic or a nonsensical offset.
+func FuzzOpenWithBaseOffset(f *testing.F) {
+	seedImages(f)
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		for _, base := range []int64{0, 512, 1 << 20, 1<<62 - 1} {
+			func() {
+				// The image is placed at base inside a sparse reader, so a
+				// correctly rebased read finds it and an unrebased one does not.
+				r := &rebasingReaderAt{data: data, base: base}
+				v, err := OpenWithOptions(r, OpenOptions{BaseOffset: base})
+				if err != nil {
+					return
+				}
+				defer v.Close()
+
+				if got := v.BaseOffset(); got != base {
+					t.Fatalf("BaseOffset() = %d, want %d", got, base)
+				}
+				// Every offset the volume reports must lie inside the volume's
+				// own extent, which is what being image-absolute means.
+				lo, hi := v.BaseOffset(), v.BaseOffset()+int64(v.VolumeSize())
+				if hi < lo {
+					t.Fatalf("volume extent [%d,%d) wrapped", lo, hi)
+				}
+
+				root, err := v.GetRootDirectory()
+				if err != nil {
+					return
+				}
+				entries, err := root.ReadDir()
+				if err != nil {
+					return
+				}
+				for _, e := range entries {
+					if e.EntryAbsoluteOffset != -1 &&
+						(e.EntryAbsoluteOffset < lo || e.EntryAbsoluteOffset >= hi) {
+						t.Fatalf("entry offset %d outside the volume extent [%d,%d)",
+							e.EntryAbsoluteOffset, lo, hi)
+					}
+					ranges, ferr := v.FragmentOffsets(e)
+					if ferr != nil {
+						continue
+					}
+					var want int64
+					for _, rg := range ranges {
+						if rg.StartByte < lo || rg.EndByte() > hi {
+							t.Fatalf("range [%d,%d) outside the volume extent [%d,%d)",
+								rg.StartByte, rg.EndByte(), lo, hi)
+						}
+						if rg.FileOffset != want {
+							t.Fatalf("FileOffset = %d, want %d", rg.FileOffset, want)
+						}
+						want += rg.Length
+					}
+				}
+			}()
+		}
+	})
+}

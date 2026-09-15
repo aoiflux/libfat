@@ -6,21 +6,45 @@ import (
 	"errors"
 	"io"
 	"math"
+	"time"
 )
 
 // FATReport is a volume-level view of a FAT image, in the shape the sibling
 // filesystem libraries emit so that reports from several filesystems can be
 // consumed together.
 //
-// StartOffset and EndOffset describe the volume within the reader it was opened
-// over. EndOffset is exclusive, matching Range.EndByte and FileFragment.
+// StartOffset and EndOffset bound the volume within the reader it was opened
+// over. StartOffset is the volume's BaseOffset rather than zero, and EndOffset
+// is exclusive, matching Range.EndByte and FileFragment: every offset in this
+// document is absolute within that reader, so the bounds are stated the same
+// way.
 type FATReport struct {
+	// SchemaVersion identifies the shape of this document, so that a consumer
+	// reading one produced years earlier can pin what it understands and
+	// recognise one it does not.
+	//
+	// It increments when a field is removed, renamed, or changes meaning.
+	// Adding a field does not increment it, because a reader that ignores
+	// unknown keys is unaffected by one.
+	SchemaVersion int `json:"schema_version"`
+	// LibraryVersion is the libfat version that produced this document, and
+	// Generated is when it did.
+	//
+	// Generated is wall-clock time, so it is the one field here that differs
+	// between two reports of an unchanged volume. A consumer hashing a report
+	// to detect change must exclude it.
+	LibraryVersion string    `json:"library_version"`
+	Generated      time.Time `json:"generated"`
+
 	Name        string    `json:"name"`
 	StartOffset int64     `json:"start_offset"`
 	EndOffset   int64     `json:"end_offset"`
 	Filesystem  FATMeta   `json:"fat_meta"`
 	Files       []FATFile `json:"files"`
 }
+
+// ReportSchemaVersion is the SchemaVersion this build of libfat writes.
+const ReportSchemaVersion = 1
 
 // FATMeta describes the volume's geometry and the provenance of the structures
 // it was read from.
@@ -76,6 +100,14 @@ type FATMeta struct {
 // located - all of which would otherwise be indistinguishable from "not
 // reported".
 type FATFile struct {
+	// Path is the entry's full path from the volume root, and Name is its
+	// basename alone. The sibling libxfat report names these the same way.
+	//
+	// Filename is the full path too: it predates Path and is retained because
+	// removing it would break every existing consumer. Prefer Path in new code;
+	// the two are always equal.
+	Path     string `json:"path"`
+	Name     string `json:"name"`
 	Filename string `json:"filename"`
 	// Type is file, directory, volume_label or virtual.
 	Type string `json:"type"`
@@ -276,9 +308,13 @@ func (v *Volume) ReportWithOptionsContext(ctx context.Context, name string, opts
 	}
 
 	report := &FATReport{
+		SchemaVersion:  ReportSchemaVersion,
+		LibraryVersion: Version,
+		Generated:      time.Now().UTC(),
+
 		Name:        name,
-		StartOffset: 0,
-		EndOffset:   int64(v.VolumeSize()),
+		StartOffset: v.BaseOffset(),
+		EndOffset:   v.endOffset(),
 		Filesystem:  v.reportMeta(),
 		Files:       []FATFile{},
 	}
@@ -326,6 +362,8 @@ func (v *Volume) reportMeta() FATMeta {
 // entry is evidence whether or not its data can be located.
 func (v *Volume) reportFile(e DirEntry, opts ReportOptions) FATFile {
 	row := FATFile{
+		Path:                e.Path,
+		Name:                e.Name,
 		Filename:            e.Path,
 		Type:                entryType(e),
 		FirstCluster:        e.FirstCluster,
@@ -383,10 +421,10 @@ func (v *Volume) reportFile(e DirEntry, opts ReportOptions) FATFile {
 
 	if opts.IncludeSlack && !e.IsDirectory {
 		if slack, ok, serr := v.SlackRange(e); serr == nil && ok {
-			frag := toFileFragments([]Range{slack})[0]
 			// Slack sits past the end of the file, so it has no offset within
-			// it. Report the file's size, which is where the slack begins.
-			frag.FileOffset = row.Size
+			// it; SlackRange reports the file's size, which is where the slack
+			// begins, and toFileFragments carries that through.
+			frag := toFileFragments([]Range{slack})[0]
 			row.Slack = &frag
 		}
 	}
@@ -407,21 +445,20 @@ func entryType(e DirEntry) string {
 }
 
 // toFileFragments converts the package's Range list into the report's extent
-// type, filling in the file-relative offset that Range does not carry.
+// type. The two carry the same facts; the report states the run's end as well
+// as its length because a document is read without the help of EndByte.
 func toFileFragments(ranges []Range) []FileFragment {
 	out := make([]FileFragment, 0, len(ranges))
-	var fileOffset int64
 	for _, r := range ranges {
 		out = append(out, FileFragment{
 			StartOffset:  r.StartByte,
 			EndOffset:    r.EndByte(),
-			FileOffset:   fileOffset,
+			FileOffset:   r.FileOffset,
 			Length:       r.Length,
 			Sparse:       r.Sparse,
 			StartCluster: r.StartCluster,
 			ClusterCount: r.ClusterCount,
 		})
-		fileOffset += r.Length
 	}
 	return out
 }
