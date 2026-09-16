@@ -74,7 +74,7 @@ type OpenOptions struct {
 	// confident wrong answer rather than an error.
 	//
 	// It must not be negative. The zero value reproduces the behaviour of every
-	// release before v0.4.0 exactly.
+	// release before v0.3.1 exactly.
 	BaseOffset int64 `json:"base_offset"`
 }
 

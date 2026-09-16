@@ -7,6 +7,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.1] - 2026-09-16
+
 The Go API is additive: no exported symbol was removed, renamed, or
 re-signatured, and no JSON key was removed or renamed. Reports gain keys, which
 a consumer that ignores unknown keys is unaffected by.
@@ -91,6 +95,11 @@ under *Fixed*.
   before and after this change will see a difference on affected volumes without
   the volume having changed.
 - `constants.go` had no trailing newline, the only `gofmt` deviation in the tree.
+- **`Version` was stale.** The constant read `0.2.0` while the repository was
+  tagged `v0.3.0`. It was referenced nowhere until this release, which exposes it
+  as the report's `library_version`, so every report written between that field
+  landing and now names the wrong build. It now reads `0.3.1` and is part of the
+  release checklist.
 
 ### Tests
 
@@ -137,7 +146,7 @@ This release adds `FileOffset` to libfat's; libxfat needs the same field, with
 the same name, the same `json:"file_offset"` tag and the same meaning, populated
 by its `FragmentOffsets`. Until that lands the two types differ by one field.
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-09-10
 
 The Go API is additive: no exported symbol was removed, renamed, or
 re-signatured. The *JSON* output of the previously untagged exported structs

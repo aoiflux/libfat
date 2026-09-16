@@ -19,7 +19,13 @@ Implemented now:
 - File reads via `Read`, `ReadAt`, and `ReadAll`
 - Directory enumeration via `ReadDir`
 - Per-file fragment / data-run export: absolute image byte ranges via
-  `FragmentOffsets`, with provenance flags for degraded chains
+  `FragmentOffsets`, with provenance flags for degraded chains, and
+  `Range.FileOffset` giving each run's position in the file's own byte space
+- Whole-disk coordinates for a partition via `OpenOptions.BaseOffset`, so every
+  reported offset can be compared against externally supplied byte ranges with
+  no adjustment by the caller
+- Recursive traversal via `Volume.Walk`, with deleted records and orphan runs
+  opt-in
 - Fragment-aware streaming reads (`Reader`, `ReaderAt`, `SectionReader`) that do
   not buffer the whole file
 - Absolute directory-entry offsets (`EntryAbsoluteOffset`), correct even for
@@ -32,8 +38,17 @@ Implemented now:
   path leads to
 - FAT32 FSInfo parsing with free-cluster and next-free hints
 - Optional forced FAT type parsing via `OpenWithFATType`
+- The volume's real label, read from the root directory's volume-ID record
+  rather than the boot sector's stale copy, with both readings and their
+  provenance exposed
+- JSON forensic reports carrying `schema_version`, `library_version` and
+  per-row extent provenance
+- Format introspection via `Volume.Capabilities()`, so a caller handling several
+  filesystems can ask what FAT records instead of special-casing on its name
 - Unit tests over synthetic images with explicitly chosen cluster layouts, an
   adversarial corpus, and fuzz targets asserting panic-freedom
+- Opt-in validation against real disk images and a purpose-built 14-volume
+  synthetic corpus, cross-checked against an independent implementation
 - exFAT support is provided by the companion library:
   https://github.com/aoiflux/libxfat
 
@@ -163,6 +178,13 @@ Every row carries a `layout` object holding the provenance flags — `chain_walk
 extent is never indistinguishable from a verified one. `ReportDeep` searches more
 places but never relaxes the evidence: it does not set `AssumeContiguous`.
 
+Each document names its own shape. `schema_version` increments only when a key
+is removed, renamed, or changes meaning — never on an addition — so a
+consumer that ignores unknown keys can pin to it rather than to a library
+release. `library_version` records the build that wrote the report, and
+`generated` the time it was written, which is the one key to exclude when
+hashing two reports of the same volume for comparison.
+
 ## Locating file data
 
 For forensic work the central operation is mapping a file to the byte ranges it
@@ -181,6 +203,11 @@ for _, r := range ranges {
 Consecutive clusters are coalesced, so one `Range` means the file is contiguous
 and more than one means it is fragmented. Ranges sum to the entry's size; the
 unused tail of the final cluster is reported separately by `SlackRange`.
+
+Ranges come back in file order and gap-free, and each carries `FileOffset`:
+where that run begins inside the file itself. Mapping a changed image range back
+to a position in the file therefore needs no accumulation by the caller. FAT has
+no sparse allocation, so no run is a hole.
 
 Offsets are absolute within the `io.ReaderAt` passed to `Open`, and include
 `OpenOptions.BaseOffset`. For a partition inside a whole-disk image, either open
@@ -255,6 +282,9 @@ Volume-level:
   every reported offset includes
 - `(*Volume).Capabilities() Capabilities` — what FAT records, as distinct from
   what this volume happens to record
+- `(*Volume).VolumeLabel() string` — the root directory's volume-ID record,
+  falling back to the boot sector only when there is none, with
+  `BootSectorVolumeLabel()` and `VolumeLabelSource()` exposing both readings
 
 Walking the tree:
 
@@ -381,3 +411,25 @@ wsl.exe -- sh testdata/gen_corpus.sh /mnt/e/dataset/fat_synth
 `LIBFAT_CORPUS`. Each volume's manifest entry records what only that volume
 covers, and the generated `README.md` beside the images explains each one and
 what the corpus still does not reach.
+
+### Releasing
+
+`Version` in `fat.go` is not derived from the git tag, and since it is reported
+as `library_version` in every JSON report, a stale value silently misattributes
+evidence. It went out of step once already; the checklist exists so it does not
+again.
+
+1. Set `Version` in `fat.go` to the version being released.
+2. Give the `## [Unreleased]` heading in `CHANGELOG.md` the version and date,
+   and open a fresh `## [Unreleased]` above it.
+3. Bump `ReportSchemaVersion` only if a report key was removed, renamed, or
+   changed meaning. A key being added, or a value becoming more correct, does
+   not count — consumers pin to the schema to know how to parse, not to know
+   what changed.
+4. `go build ./... && go vet ./... && gofmt -l .`, then `go test ./...` and
+   `go test -race ./...`.
+5. Run the opt-in suites against the dataset, which the default `go test` skips:
+   `LIBFAT_TEST_IMAGES=/path/to/images go test -run 'TestReal|TestCorpus' -timeout 40m .`
+6. Confirm `go.mod` still has no `require` block. All six sibling filesystem
+   libraries are zero-dependency and stay that way.
+7. Tag.

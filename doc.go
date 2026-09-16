@@ -54,6 +54,20 @@
 // entry's recorded size; the unused tail of the last cluster is reported
 // separately by SlackRange.
 //
+// Each Range also carries FileOffset, where that run begins in the file's own
+// byte space, so a byte range known in image coordinates maps back to a
+// position within the file without the caller accumulating lengths:
+//
+//	for _, r := range ranges {
+//		if changedStart < r.StartByte+r.Length && changedEnd > r.StartByte {
+//			at := r.FileOffset + (changedStart - r.StartByte) // byte N of the file
+//			_ = at
+//		}
+//	}
+//
+// The runs are in file order and gap-free, so FileOffset on run i is the sum of
+// the lengths before it. FAT has no sparse allocation, so no run is a hole.
+//
 // # Deleted files
 //
 // Deleting a file frees its FAT entries, so the chain that described its layout
@@ -299,6 +313,14 @@
 // FAT chain, and dropping the key would leave a consumer unable to tell that
 // from a field this version does not emit.
 //
+// Every report names the shape it is in. schema_version identifies the document
+// layout and increments only when a key is removed, renamed, or changes
+// meaning, never on an addition, so a consumer that ignores unknown keys can
+// pin to a major shape rather than to a library release. library_version
+// records the build that wrote it, and generated the time it was written - the
+// one key that varies between two reports of the same volume, and so the one to
+// exclude when hashing a report for comparison.
+//
 // Fragment offsets follow Range: EndOffset is exclusive, one past the last
 // byte. Timestamps the entry never recorded are absent rather than rendered as
 // 0001-01-01, since absent says "not recorded", which is the truth, while a
@@ -306,6 +328,47 @@
 // even when zero, because a report row is a thing that gets diffed and wants a
 // stable key set; see File identity above for what they do and do not
 // guarantee.
+//
+// # Volume labels
+//
+// A FAT volume records its label in two independent places, and they are free
+// to disagree. BS_VolLab in the boot sector is written once at format time and
+// is never updated afterwards by Windows, which leaves it reading "NO NAME"
+// however the volume is subsequently named. The authoritative copy is a record
+// in the root directory carrying the volume-ID attribute, which is what every
+// operating system and every other tool displays.
+//
+// VolumeLabel returns the root directory's record, falling back to the boot
+// sector only when the volume has no such record. Both readings stay available,
+// because on a volume where they differ the difference is itself evidence about
+// how the volume was created and handled:
+//
+//	v.VolumeLabel()           // what the volume is called
+//	v.BootSectorVolumeLabel() // what the boot sector still says
+//	v.VolumeLabelSource()     // "root directory", "boot sector", or ""
+//
+// The report carries all three, as volume_label, boot_sector_volume_label and
+// volume_label_source.
+//
+// # Capabilities
+//
+// Capabilities reports what this volume can and cannot tell a caller, so that
+// code consuming several filesystems through the sibling libraries can ask
+// rather than special-case on the format's name:
+//
+//	if !v.Capabilities().StableFileIdentity {
+//		// FAT has no inode and no reuse counter; see File identity above.
+//	}
+//
+// Most fields are fixed by the format. Three are read from this volume's own
+// boot record and differ between volumes: SecondFAT, FSInfoSector and
+// BackupBootSector.
+//
+// Two are worth reading closely before relying on them. SubSecondTimestamps is
+// true, but only creation times carry sub-second precision - modification times
+// are accurate to two seconds and access times to a whole day - so equal
+// timestamps are not proof that a file did not change. TimezoneOffsets is
+// false: see Timestamps above.
 //
 // # Robustness
 //
