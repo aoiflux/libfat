@@ -65,7 +65,7 @@ func newTestImage(t *testing.T, fatType string) *testImage {
 		t.Fatalf("unsupported FAT type %q", fatType)
 	}
 
-	im.rootDirSectors = (im.rootEntries*dirEntrySize + im.bytesPerSector - 1) / im.bytesPerSector
+	im.rootDirSectors = (im.rootEntries*DirEntrySize + im.bytesPerSector - 1) / im.bytesPerSector
 	im.rootDirSector = im.reserved + im.numFATs*im.fatSectors
 	im.firstDataSector = im.rootDirSector + im.rootDirSectors
 	im.clusterCount = (im.totalSectors - im.firstDataSector) / im.spc
@@ -184,8 +184,8 @@ func (im *testImage) addRootRaw(entries ...[]byte) int {
 	base := im.rootDirOffset()
 	for _, e := range entries {
 		off := base + int64(im.rootCursor)
-		copy(im.data[off:off+dirEntrySize], e)
-		im.rootCursor += dirEntrySize
+		copy(im.data[off:off+DirEntrySize], e)
+		im.rootCursor += DirEntrySize
 	}
 	return first
 }
@@ -242,7 +242,8 @@ func (im *testImage) addFile(f testFile) {
 	}
 	short := makeShortEntry(f.base, f.ext, f.attrs, uint16(cluster), f.size)
 	putUint16LE(short, 20, uint16(cluster>>16))
-	// Give every entry a timestamp so that isValidShortEntry accepts it.
+	// Give every entry a timestamp so that isPlausibleRecoveredEntry accepts it
+	// once deleted.
 	putUint16LE(short, 24, 0x4A21)
 	putUint16LE(short, 22, 0x6000)
 	if f.deleted {
@@ -267,12 +268,12 @@ func (im *testImage) writeSubdir(clusters []uint32, parent uint32, entries ...[]
 	putUint16LE(dot, 20, uint16(clusters[0]>>16))
 	dotdot := makeShortEntry("..", "", 0x10, uint16(parent), 0)
 	putUint16LE(dotdot, 20, uint16(parent>>16))
-	copy(content[0:dirEntrySize], dot)
-	copy(content[dirEntrySize:2*dirEntrySize], dotdot)
-	cursor := 2 * dirEntrySize
+	copy(content[0:DirEntrySize], dot)
+	copy(content[DirEntrySize:2*DirEntrySize], dotdot)
+	cursor := 2 * DirEntrySize
 	for _, e := range entries {
-		copy(content[cursor:cursor+dirEntrySize], e)
-		cursor += dirEntrySize
+		copy(content[cursor:cursor+DirEntrySize], e)
+		cursor += DirEntrySize
 	}
 	im.writeClusterData(clusters, content)
 }
@@ -302,12 +303,12 @@ func (im *testImage) addDeletedSubdir(name string, clusters []uint32, linkParent
 	im.t.Helper()
 
 	content := make([]byte, len(clusters)*int(im.bytesPerCluster()))
-	copy(content[0:dirEntrySize], makeShortEntry(".", "", 0x10, uint16(clusters[0]), 0))
-	copy(content[dirEntrySize:2*dirEntrySize], makeShortEntry("..", "", 0x10, 0, 0))
-	cursor := 2 * dirEntrySize
+	copy(content[0:DirEntrySize], makeShortEntry(".", "", 0x10, uint16(clusters[0]), 0))
+	copy(content[DirEntrySize:2*DirEntrySize], makeShortEntry("..", "", 0x10, 0, 0))
+	cursor := 2 * DirEntrySize
 	for _, e := range entries {
-		copy(content[cursor:cursor+dirEntrySize], e)
-		cursor += dirEntrySize
+		copy(content[cursor:cursor+DirEntrySize], e)
+		cursor += DirEntrySize
 	}
 	im.writeClusterData(clusters, content)
 

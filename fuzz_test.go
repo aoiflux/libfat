@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -127,6 +128,40 @@ func FuzzParseDirectoryEntries(f *testing.F) {
 				}
 			}
 		}
+
+		// Beyond panic-freedom, this target holds Strict to its contract: it
+		// may refuse a directory but never alter one, so whenever it accepts,
+		// its listing is exactly the tolerant listing.
+		const rootBytes = 512 * DirEntrySize
+		img := append([]byte(nil), im...)
+		region := img[rootStart : rootStart+rootBytes]
+		clear(region)
+		copy(region, data)
+		list := func(opts OpenOptions) ([]DirEntry, error) {
+			v, err := OpenWithOptions(bytes.NewReader(img), opts)
+			if err != nil {
+				t.Fatalf("the seed volume no longer opens: %v", err)
+			}
+			root, err := v.GetRootDirectory()
+			if err != nil {
+				t.Fatal(err)
+			}
+			return root.ReadDir()
+		}
+		tolerant, err := list(OpenOptions{})
+		if err != nil {
+			t.Fatalf("tolerant ReadDir failed: %v", err)
+		}
+		strict, err := list(OpenOptions{Strict: true})
+		if err != nil {
+			if !errors.Is(err, ErrStrict) {
+				t.Fatalf("strict ReadDir failed with a non-strict error: %v", err)
+			}
+			return
+		}
+		if !reflect.DeepEqual(strict, tolerant) {
+			t.Fatalf("strict accepted the directory but listed it differently:\nstrict   %+v\ntolerant %+v", strict, tolerant)
+		}
 	})
 }
 
@@ -221,7 +256,7 @@ func FuzzScanOrphans(f *testing.F) {
 				if !e.Orphaned {
 					t.Fatalf("entry %q from a scan is not marked Orphaned", e.Name)
 				}
-				if e.EntryAbsoluteOffset >= 0 && uint64(e.EntryAbsoluteOffset)+dirEntrySize > v.VolumeSize() {
+				if e.EntryAbsoluteOffset >= 0 && uint64(e.EntryAbsoluteOffset)+DirEntrySize > v.VolumeSize() {
 					t.Fatalf("entry offset %d lies outside the volume", e.EntryAbsoluteOffset)
 				}
 			}
@@ -303,11 +338,11 @@ func FuzzWalk(f *testing.F) {
 			if parent != e.ParentFirstCluster {
 				t.Fatalf("parent %d != entry.ParentFirstCluster %d", parent, e.ParentFirstCluster)
 			}
-			if parent != FixedRootCluster && (parent < defaultRootCluster || parent > v.maxClusterNumber()) {
+			if parent != FixedRootCluster && (parent < DefaultRootCluster || parent > v.maxClusterNumber()) {
 				t.Fatalf("parent cluster %d is neither the root sentinel nor a valid cluster", parent)
 			}
 			if id, ok := v.FileID(e); ok {
-				if int64(id.EntrySlotIndex)*dirEntrySize != e.EntryOffset {
+				if int64(id.EntrySlotIndex)*DirEntrySize != e.EntryOffset {
 					t.Fatalf("slot %d does not correspond to entry offset %d",
 						id.EntrySlotIndex, e.EntryOffset)
 				}

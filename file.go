@@ -6,7 +6,6 @@ import (
 	"io"
 	"path"
 	"strings"
-	"time"
 	"unicode"
 	"unicode/utf16"
 )
@@ -60,6 +59,20 @@ func (v *Volume) GetRootDirectory() (*File, error) {
 	}, nil
 }
 
+// OpenPath resolves a path from the root and returns the File it names.
+//
+// Matching is deliberately forgiving, in the way Windows is, and the rules are
+// these. The path is trimmed of surrounding spaces, '\' is accepted as a
+// separator, a leading drive designator such as "C:" is dropped, and the result
+// is cleaned with path.Clean, so "." and ".." components are resolved
+// lexically rather than through the directory records. Each component matches
+// an entry whose Name or ShortName equals it under strings.EqualFold, which is
+// Unicode simple case folding rather than the upcase table the volume was
+// written with. The first matching record wins. Deleted and virtual entries
+// never match; use OpenEntry for those.
+//
+// On a volume opened with OpenOptions.Strict, a directory crossed on the way
+// that fails a strict check fails the lookup with its *StrictError.
 func (v *Volume) OpenPath(filePath string) (*File, error) {
 	if v.IsClosed() {
 		return nil, ErrVolumeClosed
@@ -220,6 +233,12 @@ func (f *File) ReadAll() ([]byte, error) {
 		return nil, ErrVolumeClosed
 	}
 	if f.size == 0 {
+		if f.volume.strict {
+			// An empty file owns no clusters; Strict checks that it names none.
+			if _, err := f.fragments(); err != nil {
+				return nil, err
+			}
+		}
 		return []byte{}, nil
 	}
 
@@ -240,7 +259,39 @@ func (f *File) ReadAll() ([]byte, error) {
 	return buf, nil
 }
 
+// ReadDir lists the directory's entries in the order their records appear,
+// deleted entries included, and without the "." and ".." records. It is
+// ReadDirWithOptions with the zero ReadDirOptions.
 func (f *File) ReadDir() ([]DirEntry, error) {
+	return f.ReadDirWithOptions(ReadDirOptions{})
+}
+
+// ReadDirOptions selects what ReadDirWithOptions reports. The zero value is
+// what ReadDir has always reported.
+type ReadDirOptions struct {
+	// ExcludeDeleted leaves out every entry with Deleted set, including those
+	// recovered from beyond the end-of-directory marker. ReadDir reports them,
+	// with '_' standing in for the first character deletion overwrote, because
+	// a listing that hid deleted entries would hide the point of this package;
+	// a caller that wants only the live tree asks for that here.
+	ExcludeDeleted bool `json:"exclude_deleted"`
+
+	// IncludeDotEntries reports the "." and ".." records that begin every
+	// subdirectory, which ReadDir drops. Their Path is the directory's path
+	// with "/." or "/.." appended literally rather than cleaned. They are
+	// reported as records, not as a way to move around the tree: ".." in a
+	// directory directly below the root carries cluster 0, which names no
+	// cluster, so OpenEntry on it does not open the root.
+	IncludeDotEntries bool `json:"include_dot_entries"`
+}
+
+// ReadDirWithOptions lists the directory's entries as ReadDir does, filtered
+// by opts.
+//
+// On a volume opened with OpenOptions.Strict it also checks the directory's
+// records and returns a *StrictError for the first violation instead of a
+// listing; see the package documentation's Strict mode section.
+func (f *File) ReadDirWithOptions(opts ReadDirOptions) ([]DirEntry, error) {
 	if f.volume.IsClosed() {
 		return nil, ErrVolumeClosed
 	}
@@ -248,18 +299,37 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 		return nil, ErrNotDirectory
 	}
 
+	// A directory reached through a deleted or orphaned record is being
+	// recovered, not listed, and Strict does not apply to it.
+	strict := f.volume.strict && !f.entry.Deleted && !f.entry.Orphaned
+	dirCluster := f.identityCluster()
+
 	var data []byte
 	var ranges []Range
 	var err error
 	if f.isRoot {
-		data, err = f.volume.readRootDirectoryData()
+		data, err = f.volume.readRootDirectoryData(strict)
 		ranges, _ = f.volume.RootDirectoryFragments()
 	} else {
-		data, err = f.volume.readClusterChain(f.firstCluster, -1)
+		data, err = f.volume.readClusterChain(f.firstCluster, -1, strict)
 		ranges, _ = f.volume.ClusterChainFragments(f.firstCluster, 0)
 	}
 	if err != nil {
+		var se *StrictError
+		if errors.As(err, &se) {
+			// The chain belongs to this directory, so the record at fault is
+			// this directory's own entry in its parent. The root has none.
+			if f.isRoot {
+				return nil, se.atEntry(dirCluster, -1)
+			}
+			return nil, se.atEntry(f.entry.ParentFirstCluster, f.entry.EntryOffset)
+		}
 		return nil, err
+	}
+	if strict {
+		if se := f.volume.strictDirectory(data, dirCluster, f.isRoot); se != nil {
+			return nil, se
+		}
 	}
 
 	// A failure to resolve the directory's own fragments must not fail the
@@ -270,11 +340,26 @@ func (f *File) ReadDir() ([]DirEntry, error) {
 		includeVolumeLabels: f.volume.includeVolumeLabelEntries,
 		recoverDeletedLFN:   f.volume.recoverDeletedLongNames,
 		mapOffset:           rangeOffsetMapper(ranges),
-		parentFirstCluster:  f.identityCluster(),
+		parentFirstCluster:  dirCluster,
+		includeDots:         opts.IncludeDotEntries,
 	}
 	entries := parseDirectoryEntries(data, ctx)
+	if strict {
+		if se := strictDuplicates(entries, dirCluster); se != nil {
+			return nil, se
+		}
+	}
 	if f.isRoot && f.volume.includeVirtualRootEntries {
 		entries = append(entries, virtualRootEntries()...)
+	}
+	if opts.ExcludeDeleted {
+		live := entries[:0]
+		for _, e := range entries {
+			if !e.Deleted {
+				live = append(live, e)
+			}
+		}
+		entries = live
 	}
 	return entries, nil
 }
@@ -339,7 +424,7 @@ func (v *Volume) deletedDirectoryChildren(e DirEntry) ([]DirEntry, bool, error) 
 		// Reallocated: the cluster now belongs to something else.
 		return nil, false, nil
 	}
-	if e.FirstCluster < defaultRootCluster || e.FirstCluster > v.maxClusterNumber() {
+	if e.FirstCluster < DefaultRootCluster || e.FirstCluster > v.maxClusterNumber() {
 		return nil, false, nil
 	}
 	if v.bytesPerCluster == 0 {
@@ -372,6 +457,7 @@ func (v *Volume) deletedDirectoryChildren(e DirEntry) ([]DirEntry, bool, error) 
 		recoverDeletedLFN:   v.recoverDeletedLongNames,
 		mapOffset:           rangeOffsetMapper(ranges),
 		parentFirstCluster:  e.FirstCluster,
+		recovery:            true,
 	})
 	return entries, true, nil
 }
@@ -391,6 +477,12 @@ type dirParseContext struct {
 	// every entry so that an entry carries the logical address of its own record
 	// and not only the physical one, which relocation invalidates.
 	parentFirstCluster uint32
+	// recovery marks data that is being recovered rather than listed: a deleted
+	// directory's surviving cluster or an orphan run. Every record in it is held
+	// to isPlausibleRecoveredEntry, as deleted records are everywhere.
+	recovery bool
+	// includeDots reports the "." and ".." records instead of skipping them.
+	includeDots bool
 }
 
 func (c *dirParseContext) absolute(bufOffset int) int64 {
@@ -414,16 +506,8 @@ type deletedLFNSlot struct {
 	full bool
 }
 
-// maxLFNSlots is the largest number of long-name slots a single entry may use
-// (20 slots x 13 UTF-16 code units = 260 characters).
-const maxLFNSlots = 20
-
-// lfnCharsPerSlot is the number of UTF-16 code units stored in one long-name
-// slot.
-const lfnCharsPerSlot = 13
-
 func parseDirectoryEntries(data []byte, ctx *dirParseContext) []DirEntry {
-	entries := make([]DirEntry, 0, len(data)/dirEntrySize)
+	entries := make([]DirEntry, 0, len(data)/DirEntrySize)
 	var lfnParts [][]uint16
 	var lfnActive bool
 	var lfnExpectedSeq byte
@@ -442,24 +526,24 @@ func parseDirectoryEntries(data []byte, ctx *dirParseContext) []DirEntry {
 	}
 	resetLFN()
 
-	for offset := 0; offset+dirEntrySize <= len(data); offset += dirEntrySize {
-		entry := data[offset : offset+dirEntrySize]
+	for offset := 0; offset+DirEntrySize <= len(data); offset += DirEntrySize {
+		entry := data[offset : offset+DirEntrySize]
 		firstByte := entry[0]
 		if firstByte == 0x00 {
 			seenEndMarker = true
 			resetLFN()
 			continue
 		}
-		deleted := firstByte == 0xE5
+		deleted := firstByte == DeletedMarker
 		attributes := entry[11]
 		recovered := seenEndMarker && deleted
 
-		if seenEndMarker && !deleted && attributes != attrLongName {
+		if seenEndMarker && !deleted && attributes != AttrLongName {
 			resetLFN()
 			continue
 		}
 
-		if attributes == attrLongName {
+		if attributes == AttrLongName {
 			if !isValidLFNEntry(entry, deleted) {
 				resetLFN()
 				continue
@@ -475,7 +559,7 @@ func parseDirectoryEntries(data []byte, ctx *dirParseContext) []DirEntry {
 				}
 				lfnParts = nil
 				lfnActive = false
-				if len(deletedSlots) >= maxLFNSlots {
+				if len(deletedSlots) >= MaxLFNSlots {
 					deletedSlots = deletedSlots[1:]
 				}
 				part := parseLFNPart(entry)
@@ -483,7 +567,7 @@ func parseDirectoryEntries(data []byte, ctx *dirParseContext) []DirEntry {
 					offset:   offset,
 					checksum: entry[13],
 					part:     part,
-					full:     len(part) == lfnCharsPerSlot,
+					full:     len(part) == LFNCharsPerSlot,
 				})
 				continue
 			}
@@ -493,7 +577,7 @@ func parseDirectoryEntries(data []byte, ctx *dirParseContext) []DirEntry {
 			ord := seq & 0x3F
 			chk := entry[13]
 
-			if seq&0x40 != 0 {
+			if seq&LFNLastFlag != 0 {
 				resetLFN()
 				lfnActive = true
 				lfnExpectedSeq = ord
@@ -511,12 +595,16 @@ func parseDirectoryEntries(data []byte, ctx *dirParseContext) []DirEntry {
 			continue
 		}
 
-		if !isValidShortEntry(entry) {
+		valid := isValidShortEntry(entry)
+		if valid && (deleted || ctx.recovery) {
+			valid = isPlausibleRecoveredEntry(entry)
+		}
+		if !valid {
 			resetLFN()
 			continue
 		}
 
-		if attributes&attrVolumeID != 0 {
+		if attributes&AttrVolumeID != 0 {
 			if ctx.includeVolumeLabels {
 				label := parseVolumeLabel(entry, deleted)
 				if label != "" {
@@ -573,7 +661,8 @@ func parseDirectoryEntries(data []byte, ctx *dirParseContext) []DirEntry {
 		}
 		resetLFN()
 
-		if name == "." || name == ".." || name == "" {
+		isDot := name == "." || name == ".."
+		if name == "" || (isDot && !ctx.includeDots) {
 			continue
 		}
 
@@ -588,19 +677,23 @@ func parseDirectoryEntries(data []byte, ctx *dirParseContext) []DirEntry {
 		if ctx.dirPath == "/" {
 			fullPath = "/" + name
 		}
+		if isDot {
+			// Joined literally: path.Join would clean "/DIR/.." to "/".
+			fullPath = strings.TrimSuffix(ctx.dirPath, "/") + "/" + name
+		}
 
 		entries = append(entries, DirEntry{
 			Name:                name,
 			Path:                fullPath,
 			ShortName:           shortName,
-			IsDirectory:         attributes&attrDirectory != 0,
+			IsDirectory:         attributes&AttrDirectory != 0,
 			Size:                uint64(ReadUint32LE(entry, 28)),
 			FirstCluster:        firstCluster,
 			ClusterAllocated:    clusterAllocated,
 			Attributes:          attributes,
-			CreatedAt:           decodeFATDateTime(ReadUint16LE(entry, 16), ReadUint16LE(entry, 14), entry[13]),
-			ModifiedAt:          decodeFATDateTime(ReadUint16LE(entry, 24), ReadUint16LE(entry, 22), 0),
-			AccessedAt:          decodeFATDateTime(ReadUint16LE(entry, 18), 0, 0),
+			CreatedAt:           DecodeDateTime(ReadUint16LE(entry, 16), ReadUint16LE(entry, 14), entry[13]),
+			ModifiedAt:          DecodeDateTime(ReadUint16LE(entry, 24), ReadUint16LE(entry, 22), 0),
+			AccessedAt:          DecodeDateTime(ReadUint16LE(entry, 18), 0, 0),
 			Deleted:             deleted,
 			Recovered:           recovered,
 			EntryOffset:         int64(offset),
@@ -655,7 +748,7 @@ func recoverDeletedLFNName(shortEntry []byte, slots []deletedLFNSlot) (string, b
 		if slot.checksum != target {
 			break
 		}
-		if nextOffset >= 0 && slot.offset+dirEntrySize != nextOffset {
+		if nextOffset >= 0 && slot.offset+DirEntrySize != nextOffset {
 			break
 		}
 		nextOffset = slot.offset
@@ -665,7 +758,7 @@ func recoverDeletedLFNName(shortEntry []byte, slots []deletedLFNSlot) (string, b
 			bounded = true
 			break
 		}
-		if len(run) >= maxLFNSlots {
+		if len(run) >= MaxLFNSlots {
 			break
 		}
 	}
@@ -778,7 +871,7 @@ func recoverFirstChar(name11 []byte, target byte) (byte, bool) {
 			continue
 		}
 		b := byte(value)
-		if b == ' ' || b == 0xE5 || !isValid83Char(b, false) {
+		if b == ' ' || b == DeletedMarker || !isValid83Char(b, false) {
 			return 0, false
 		}
 		return b, true
@@ -835,10 +928,10 @@ func isValidLFNEntry(entry []byte, deleted bool) bool {
 
 func isValidShortEntry(entry []byte) bool {
 	attributes := entry[11]
-	if attributes&^byte(attrReadOnly|attrHidden|attrSystem|attrVolumeID|attrDirectory|attrArchive) != 0 {
+	if attributes&^byte(AttrReadOnly|AttrHidden|AttrSystem|AttrVolumeID|AttrDirectory|AttrArchive) != 0 {
 		return false
 	}
-	if attributes&attrVolumeID != 0 && attributes&(attrDirectory|attrReadOnly|attrArchive) != 0 {
+	if attributes&AttrVolumeID != 0 && attributes&(AttrDirectory|AttrReadOnly|AttrArchive) != 0 {
 		return false
 	}
 
@@ -847,21 +940,32 @@ func isValidShortEntry(entry []byte) bool {
 	if size > 0 && cluster == 0 {
 		return false
 	}
-	if attributes&attrDirectory != 0 && size != 0 {
+	if attributes&AttrDirectory != 0 && size != 0 {
 		return false
 	}
-	if attributes&attrVolumeID != 0 {
+	if attributes&AttrVolumeID != 0 {
 		return true
 	}
-	if !looksLikeShortName(entry[0:8], entry[8:11]) {
-		return false
-	}
+	return looksLikeShortName(entry[0:8], entry[8:11])
+}
 
-	hasTimestamp := ReadUint16LE(entry, 14) != 0 || ReadUint16LE(entry, 16) != 0 || ReadUint16LE(entry, 18) != 0 || ReadUint16LE(entry, 22) != 0 || ReadUint16LE(entry, 24) != 0
-	if !hasTimestamp && cluster == 0 && size == 0 {
+// isPlausibleRecoveredEntry is isValidShortEntry plus a heuristic that rejects
+// records carrying no times, no cluster and no size. Such a record is a valid
+// empty file when it is live, and is listed as one, but in data that is being
+// recovered - a deleted record, or a cluster swept by the orphan scan - it is
+// far more often residue that happens to parse, and it carries nothing that
+// would be worth reporting even when it is genuine.
+func isPlausibleRecoveredEntry(entry []byte) bool {
+	if !isValidShortEntry(entry) {
 		return false
 	}
-	return true
+	if entry[11]&AttrVolumeID != 0 {
+		return true
+	}
+	cluster := uint32(ReadUint16LE(entry, 26)) | (uint32(ReadUint16LE(entry, 20)) << 16)
+	size := ReadUint32LE(entry, 28)
+	hasTimestamp := ReadUint16LE(entry, 14) != 0 || ReadUint16LE(entry, 16) != 0 || ReadUint16LE(entry, 18) != 0 || ReadUint16LE(entry, 22) != 0 || ReadUint16LE(entry, 24) != 0
+	return hasTimestamp || cluster != 0 || size != 0
 }
 
 func looksLikeShortName(base, ext []byte) bool {
@@ -871,7 +975,7 @@ func looksLikeShortName(base, ext []byte) bool {
 			seenSpace = true
 			continue
 		}
-		if i == 0 && (value == 0x05 || value == 0x2E || value == 0xE5) {
+		if i == 0 && (value == KanjiE5 || value == DotEntry || value == DeletedMarker) {
 			continue
 		}
 		if seenSpace || !isValid83Char(value, i < 2) {
@@ -921,27 +1025,30 @@ func parseShortName(entry []byte, deleted bool) string {
 // first byte has been overwritten with 0xE5; firstChar supplies the recovered
 // original when one is known, and 0 falls back to the '_' placeholder.
 func parseShortNameWithFirstChar(entry []byte, deleted bool, firstChar byte) string {
-	name := make([]byte, 8)
-	copy(name, entry[0:8])
-	if deleted {
-		if firstChar != 0 && firstChar != ' ' {
-			name[0] = firstChar
-		} else {
-			name[0] = '_'
-		}
+	var name [11]byte
+	copy(name[:], entry[0:11])
+	if !deleted {
+		// 0x05 encodes a literal 0xE5 as the first character of a live entry,
+		// so that it is not mistaken for a deletion marker.
+		return ParseShortName(name, entry[12])
 	}
-	// 0x05 encodes a literal 0xE5 as the first character of a live entry, so
-	// that it is not mistaken for a deletion marker.
-	if !deleted && name[0] == 0x05 {
-		name[0] = 0xE5
+	if firstChar != 0 && firstChar != ' ' {
+		name[0] = firstChar
+	} else {
+		name[0] = '_'
 	}
-	base := strings.TrimRight(string(name), " ")
-	ext := strings.TrimRight(string(entry[8:11]), " ")
-	lowercase := entry[12]
-	if lowercase&0x08 != 0 {
+	return formatShortName(name, entry[12])
+}
+
+// formatShortName trims, joins and case-folds an 11-byte name field whose first
+// byte has already been resolved.
+func formatShortName(name [11]byte, ntres byte) string {
+	base := strings.TrimRight(string(name[0:8]), " ")
+	ext := strings.TrimRight(string(name[8:11]), " ")
+	if ntres&NTResLowerBase != 0 {
 		base = strings.ToLower(base)
 	}
-	if lowercase&0x10 != 0 {
+	if ntres&NTResLowerExt != 0 {
 		ext = strings.ToLower(ext)
 	}
 	if ext == "" {
@@ -972,7 +1079,7 @@ func virtualRootEntries() []DirEntry {
 
 func parseLFNPart(entry []byte) []uint16 {
 	part := make([]uint16, 0, 13)
-	for _, offset := range []int{1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30} {
+	for _, offset := range lfnCharOffsets {
 		value := ReadUint16LE(entry, offset)
 		if value == 0x0000 || value == 0xFFFF {
 			continue
@@ -991,23 +1098,6 @@ func assembleLFN(parts [][]uint16) string {
 		combined = append(combined, parts[i]...)
 	}
 	return string(utf16.Decode(combined))
-}
-
-func decodeFATDateTime(date, clock uint16, tenths byte) time.Time {
-	if date == 0 {
-		return time.Time{}
-	}
-	year := int((date>>9)&0x7F) + 1980
-	month := time.Month((date >> 5) & 0x0F)
-	day := int(date & 0x1F)
-	hour := int((clock >> 11) & 0x1F)
-	minute := int((clock >> 5) & 0x3F)
-	second := int(clock&0x1F) * 2
-	nsec := int(tenths) * 10 * 1_000_000
-	if month < 1 || month > 12 || day < 1 || day > 31 {
-		return time.Time{}
-	}
-	return time.Date(year, month, day, hour, minute, second, nsec, time.UTC)
 }
 
 func (f *File) String() string {

@@ -7,7 +7,119 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-Nothing yet.
+The Go API is additive: no exported symbol was removed, renamed, or
+re-signatured, and no JSON key was removed or renamed. Every new option is off
+in the zero `OpenOptions`.
+
+One existing behaviour changes, and it is a fix: `ReadDir` now lists empty files
+whose records carry no timestamps, which it used to drop. It is described under
+*Fixed*. Reports of volumes holding such files gain rows for them.
+
+### Added
+
+- **Strict mode.** `OpenOptions.Strict` turns the irregularities the default
+  reading tolerates into errors. Each one is a `*StrictError` matching the new
+  `ErrStrict`. It names the rule broken (`StrictCheck`) and locates the record
+  at fault by directory cluster and entry offset, in the terms of
+  `DirEntry.ParentFirstCluster` and `EntryOffset`. The rules:
+  - a chain that runs into a free cluster, which otherwise ends the chain;
+  - a chain that loops, reaches a bad cluster or leaves the data area;
+  - a file chain whose length is not `ceil(size/cluster size)`, where a long
+    chain is otherwise trimmed silently;
+  - a broken long-name sequence or checksum, which otherwise falls back to the
+    8.3 name;
+  - `.` and `..` missing from the head of a subdirectory, or present anywhere
+    else;
+  - names in one directory that are equal under case folding;
+  - live records after the end-of-directory marker;
+  - records that do not parse;
+  - FAT copies that disagree, unless FAT32's `BPB_ExtFlags` turns mirroring
+    off.
+
+  Strict applies to the live tree only. Deleted records, orphan recovery and
+  the label scan at open read tolerantly whatever it is set to. A call that
+  succeeds under Strict returns exactly what it returns without it. The fuzz
+  target `FuzzParseDirectoryEntries` now asserts that property.
+- **`ReadDirWithOptions`.** `ReadDirOptions.ExcludeDeleted` lists the live
+  tree only. `IncludeDotEntries` reports the `.` and `..` records, which
+  `ReadDir` drops. `ReadDir` is unchanged.
+- **`Volume.Geometry()`** returns every BPB-derived value in one struct, so a
+  caller can compute sector and cluster addresses without parsing the boot
+  sector again. It includes the first FAT sector, FAT size, root region and
+  first data sector.
+- **`OpenOptions.CacheFAT`**; see *Fixed*.
+- **Codecs for writers.** These are pure functions over single fields, exported
+  so that software writing FAT encodes by the rules this package decodes by:
+  - `EncodeDateTime` and `DecodeDateTime`. Encoding is UTC, at 10 ms, and
+    clamps to 1980-2107.
+  - `LFNChecksum`.
+  - `ValidShortName`, which is the rule `ReadDir` applies to a live record's
+    name.
+  - `ParseShortName`, which handles the `0x05` lead byte and the NTRes case
+    bits.
+  - `IsValid83Char`.
+
+  Nothing builds a volume, a FAT or a directory.
+- **On-disk constants**, exported from values that were internal or literal:
+  - attribute bits `AttrReadOnly` … `AttrLongName`;
+  - `DirEntrySize`, `DefaultRootCluster`, `FAT12MaxClusters` and
+    `FAT32MinClusters`;
+  - FAT32 entry values `FAT32Mask`, `FAT32EOC`, `FAT32EOCMin` and `FAT32Bad`;
+  - FSInfo signatures `FSInfoLeadSig`, `FSInfoStructSig` and `FSInfoTrailSig`;
+  - the long-name layout `LFNCharsPerSlot`, `LFNCharOffsets`, `LFNLastFlag`,
+    `MaxLFNSlots` and `MaxLongNameLen`;
+  - `DeletedMarker`, `KanjiE5`, `DotEntry`, `NTResLowerBase`, `NTResLowerExt`,
+    `MediaFixed` and `FAT32Signature`.
+
+  `LFNCharOffsets` is a variable because Go has no array constants. The parser
+  keeps its own copy, so assigning to it changes nothing this package reads.
+
+### Changed
+
+- `OpenPath` now documents how it matches:
+  - it trims spaces;
+  - it accepts `\` as a separator;
+  - it drops a leading drive designator;
+  - it cleans the path lexically;
+  - it compares each component to `Name` or `ShortName` with
+    `strings.EqualFold`.
+
+  Its behaviour is unchanged.
+
+### Fixed
+
+- **Empty files with no timestamps were missing from listings.** A short entry
+  with no cluster, no size and every time field zero was rejected as garbage.
+  That is also exactly what a valid empty file looks like when the tool that
+  created it does not stamp times, as some tools and embedded systems do not.
+  `ReadDir` dropped such files without a trace.
+
+  The heuristic now applies only where it belongs, to data being recovered:
+  deleted records, the orphan sweep, and the surviving first cluster of a
+  deleted directory. Live records are kept whenever their name and attribute
+  byte are valid. Orphan-scan precision is unchanged.
+- **FAT lookups were never cached.** Each step of a chain read one entry from
+  each FAT copy, and `ReadDir` did the same again for every entry it listed.
+  On a volume of 512-byte clusters, reading a 2 MB file took over 8,000
+  reads. `OpenOptions.CacheFAT` reads each copy once, on the first lookup, and
+  serves the rest from memory. The same read now takes two FAT reads, however
+  long the chain.
+
+  The cache is opt-in because it holds the whole FAT. It is skipped, silently,
+  when the copies total more than 256 MiB or cannot be read in full.
+  `FATMirrorMismatches` counts exactly as it does without the cache.
+
+### Tests
+
+- `strict_test.go` covers every strict rule. Each test builds a broken image
+  with the synthetic builder, then checks that Strict rejects it with the right
+  record and that the default reading is unchanged. A Windows-shaped image must
+  also pass Strict end to end.
+- `TestRealVolumeCodecsAgreeWithImages` re-reads every record on the real
+  images and checks the codecs against what Windows and mkfs.fat wrote:
+  `ParseShortName`, `ValidShortName`, `EncodeDateTime` and `LFNChecksum`.
+  `TestRealWindowsVolumePassesStrict` holds the Windows-written partition to
+  Strict. Both are skipped unless `LIBFAT_TEST_IMAGES` is set.
 
 ## [0.3.1] - 2026-09-16
 

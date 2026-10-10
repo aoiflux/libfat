@@ -370,6 +370,80 @@
 // timestamps are not proof that a file did not change. TimezoneOffsets is
 // false: see Timestamps above.
 //
+// # Strict mode
+//
+// The default reading is tolerant, because damaged and half-deleted volumes
+// are what forensic work is made of: a chain that runs into a free cluster
+// simply ends, a broken long name falls back to the 8.3 name, a record that
+// does not parse is skipped. A caller checking a volume that is meant to be
+// well formed - a writer verifying its own output, say - wants the opposite,
+// and asks for it with OpenOptions.Strict:
+//
+//	v, err := libfat.OpenWithOptions(r, libfat.OpenOptions{Strict: true})
+//	entries, err := dir.ReadDir()
+//	var se *libfat.StrictError
+//	if errors.As(err, &se) {
+//		fmt.Println(se.Check, se.DirCluster, se.EntryOffset)
+//	}
+//
+// A violation is a *StrictError, which matches ErrStrict and names the rule
+// (Check) and the 32-byte record at fault, by the directory's first cluster and
+// the record's offset in that directory, as DirEntry.ParentFirstCluster and
+// EntryOffset do. The checks run where the structure is read, not all at open:
+//
+//   - ReadDir and ReadDirWithOptions check the directory's records: long-name
+//     sequences and checksums; "." then ".." as the first two records of a
+//     subdirectory, with "." naming the directory itself, and neither anywhere
+//     else nor in the root; names equal under case folding, long or short;
+//     live records after the end-of-directory marker; records that do not
+//     parse; a first cluster outside the data area; and a FAT mirror
+//     disagreement on any entry's first cluster. Reading a directory's own
+//     chain also fails where it runs into a free cluster or is corrupt.
+//   - Reading a file - ReadAll, ReadAt, Read, Fragments, FragmentOffsets -
+//     walks its chain and fails where it runs into a free cluster, loops,
+//     reaches a bad-cluster marker or leaves the data area, where the FAT
+//     copies disagree about a link, or where its length is not
+//     ceil(size/cluster size). An empty file must name no cluster.
+//
+// The FAT mirror check is skipped when the volume has one FAT, or when FAT32's
+// BPB_ExtFlags says mirroring is off. A walk bounded by FragmentOptions'
+// MaxClusters or MaxRuns is not a violation: the caller chose to stop.
+//
+// Strict covers the live tree only. Deleted records, OpenEntry on a deleted or
+// orphaned entry, ScanOrphans, and the label scan at open read the volume
+// tolerantly whatever it is set to, since what they read is damaged by
+// definition. And Strict can refuse a call but never change one: a listing or
+// a read that succeeds under Strict is identical to the tolerant result, which
+// is why the checks are separate passes rather than branches in the parser.
+// Walk inherits the checks through ReadDir, but skips a directory that fails
+// one as it skips any unreadable directory; set WalkOptions.StopOnReadError to
+// surface the error.
+//
+// # Codecs for writers
+//
+// This package reads FAT; it does not write it. The pure encodings that a
+// writer must agree with it on are exported all the same, so that a volume
+// written by one and read by the other cannot disagree about what a field
+// means: EncodeDateTime and DecodeDateTime, LFNChecksum, IsValid83Char,
+// ValidShortName and ParseShortName, and the constants they work with -
+// attribute bits, FAT32 entry values, FSInfo signatures, the long-name slot
+// layout in LFNCharOffsets. EncodeDateTime clamps a time outside 1980-2107
+// rather than failing, and works in UTC, as DecodeDateTime does.
+//
+// None of them lays out a volume, a FAT or a directory, and short-name
+// generation (the ~N tails) is the writer's own.
+//
+// # FAT cache
+//
+// Every step along a chain and every entry ReadDir lists costs a FAT lookup,
+// and by default each lookup is one read per FAT copy. On a volume of small
+// clusters that makes reading a large file tens of thousands of reads.
+// OpenOptions.CacheFAT reads each copy once, on the first lookup, and serves
+// the rest from memory. It is opt-in because it holds the whole FAT: it is
+// skipped, and lookups read the image as before, when the copies total more
+// than 256 MiB or cannot be read whole. Nothing else about the volume changes,
+// FATMirrorMismatches included.
+//
 // # Robustness
 //
 // Every exported entry point is read-only and panic-free on arbitrary input,

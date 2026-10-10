@@ -175,7 +175,14 @@ func (v *Volume) fragmentOffsets(entry DirEntry, opts FragmentOptions) (*Fragmen
 		size = int64(entry.Size)
 	}
 
-	if entry.FirstCluster < defaultRootCluster {
+	strict := v.strict && !entry.Deleted && !entry.Orphaned
+	if strict && entry.FirstCluster == 1 {
+		return nil, &StrictError{
+			Check: StrictChainCorrupt, DirCluster: entry.ParentFirstCluster, EntryOffset: entry.EntryOffset,
+			Cluster: 1, Detail: "first cluster 1 is outside the data area", Err: ErrCorruptStructure,
+		}
+	}
+	if entry.FirstCluster < DefaultRootCluster {
 		if entry.Size == 0 {
 			return &FragmentResult{Ranges: nil}, nil
 		}
@@ -194,9 +201,14 @@ func (v *Volume) fragmentOffsets(entry DirEntry, opts FragmentOptions) (*Fragmen
 		return v.deletedFragments(entry, size, opts)
 	}
 
-	result, err := v.walkChainRuns(entry.FirstCluster, opts)
+	result, stop, err := v.walkChain(entry.FirstCluster, opts, strict)
 	if err != nil {
 		return nil, err
+	}
+	if strict {
+		if se := v.strictChain(entry, result, stop); se != nil {
+			return nil, se
+		}
 	}
 	v.finalizeRuns(result, size)
 
@@ -356,8 +368,37 @@ func (v *Volume) ClusterChain(startCluster uint32) ([]uint32, error) {
 // never discards work: when the chain is broken, loops, or hits a cap, the runs
 // gathered so far are returned with the corresponding flag set.
 func (v *Volume) walkChainRuns(startCluster uint32, opts FragmentOptions) (*FragmentResult, error) {
-	if startCluster < defaultRootCluster || startCluster > v.maxClusterNumber() {
-		return nil, fmt.Errorf("%w: invalid start cluster %d", ErrCorruptStructure, startCluster)
+	result, _, err := v.walkChain(startCluster, opts, false)
+	return result, err
+}
+
+// chainStop records why a chain walk stopped, which FragmentResult's flags
+// deliberately blur: ChainBroken covers a free entry, a bad cluster and a
+// caller's cap alike, and Strict must tell them apart.
+type chainStop struct {
+	reason  chainStopReason
+	cluster uint32 // the cluster whose FAT entry stopped the walk
+	err     error  // the lookup error, for stopRead
+}
+
+type chainStopReason uint8
+
+const (
+	stopEnd   chainStopReason = iota // an end-of-chain marker
+	stopFree                         // a free (0) entry
+	stopBad                          // a bad-cluster marker
+	stopRange                        // a successor outside the data area
+	stopLoop                         // a cluster visited twice
+	stopRead                         // the FAT entry could not be read
+	stopCap                          // MaxRuns or MaxClusters
+)
+
+// walkChain is walkChainRuns reporting why the walk stopped, and applying
+// Strict's FAT mirror check to each lookup when strict is set.
+func (v *Volume) walkChain(startCluster uint32, opts FragmentOptions, strict bool) (*FragmentResult, chainStop, error) {
+	var stop chainStop
+	if startCluster < DefaultRootCluster || startCluster > v.maxClusterNumber() {
+		return nil, stop, fmt.Errorf("%w: invalid start cluster %d", ErrCorruptStructure, startCluster)
 	}
 
 	maxClusters := opts.MaxClusters
@@ -400,6 +441,7 @@ func (v *Volume) walkChainRuns(startCluster uint32, opts FragmentOptions) (*Frag
 		if _, ok := seen[current]; ok {
 			result.LoopDetected = true
 			result.ChainBroken = true
+			stop = chainStop{reason: stopLoop, cluster: current}
 			break
 		}
 		if len(seen) < maxSeenTracked {
@@ -408,56 +450,68 @@ func (v *Volume) walkChainRuns(startCluster uint32, opts FragmentOptions) (*Frag
 
 		if runCount > 0 && current != runStart+runCount {
 			if err := flush(); err != nil {
-				return nil, err
+				return nil, stop, err
 			}
 		}
 		if runCount == 0 {
 			runStart = current
 			if opts.MaxRuns > 0 && len(result.Ranges) >= opts.MaxRuns {
 				result.ChainBroken = true
+				stop = chainStop{reason: stopCap, cluster: current}
 				break
 			}
 		}
 		runCount++
 		result.ClustersWalked++
 
-		next, err := v.readFATEntry(current)
+		next, err := v.readFATEntryMode(current, strict)
 		if err != nil {
 			result.ChainBroken = true
+			stop = chainStop{reason: stopRead, cluster: current, err: err}
 			break
 		}
 		if next == 0 {
 			// A free entry mid-chain: the chain does not terminate properly.
 			result.ChainBroken = true
+			stop = chainStop{reason: stopFree, cluster: current}
 			break
 		}
 		if v.isBadCluster(next) {
 			result.ChainBroken = true
+			stop = chainStop{reason: stopBad, cluster: current}
 			break
 		}
 		if v.isEndOfChain(next) {
 			break
 		}
-		if next < defaultRootCluster || next > v.maxClusterNumber() {
+		if next < DefaultRootCluster || next > v.maxClusterNumber() {
 			result.ChainBroken = true
+			stop = chainStop{reason: stopRange, cluster: current}
 			break
 		}
 		// The cap is checked only once a genuine continuation is known, so a
 		// chain that ends exactly at the cap is not misreported as broken.
 		if result.ClustersWalked >= maxClusters {
 			result.ChainBroken = true
+			stop = chainStop{reason: stopCap, cluster: current}
+			if maxClusters == v.clusterCount {
+				// No chain can be longer than the volume. Reaching this bound
+				// means the walk is going round a loop the seen set, being
+				// capped, did not catch.
+				stop.reason = stopLoop
+			}
 			break
 		}
 		current = next
 	}
 
 	if err := flush(); err != nil {
-		return nil, err
+		return nil, stop, err
 	}
 	for _, r := range result.Ranges {
 		result.BytesCovered += r.Length
 	}
-	return result, nil
+	return result, stop, nil
 }
 
 // finalizeRuns trims the run list to size bytes and sets Truncated. A size of

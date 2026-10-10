@@ -107,10 +107,10 @@ func (v *Volume) FileID(e DirEntry) (FileID, bool) {
 	if v.IsClosed() || e.Virtual {
 		return FileID{}, false
 	}
-	if e.EntryOffset < 0 || e.EntryOffset%dirEntrySize != 0 {
+	if e.EntryOffset < 0 || e.EntryOffset%DirEntrySize != 0 {
 		return FileID{}, false
 	}
-	slot := e.EntryOffset / dirEntrySize
+	slot := e.EntryOffset / DirEntrySize
 	if slot > int64(math.MaxUint32) {
 		return FileID{}, false
 	}
@@ -123,7 +123,7 @@ func (v *Volume) FileID(e DirEntry) (FileID, bool) {
 		}
 		return FileID{ParentFirstCluster: FixedRootCluster, EntrySlotIndex: uint32(slot)}, true
 	}
-	if parent < defaultRootCluster || parent > v.maxClusterNumber() {
+	if parent < DefaultRootCluster || parent > v.maxClusterNumber() {
 		return FileID{}, false
 	}
 	return FileID{ParentFirstCluster: parent, EntrySlotIndex: uint32(slot)}, true

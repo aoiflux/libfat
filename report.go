@@ -364,7 +364,7 @@ func (v *Volume) reportMeta() FATMeta {
 		VolumeLabelSource:     v.VolumeLabelSource(),
 		UsedBackupBootSector:  v.UsedBackupBootSector(),
 	}
-	if offset, err := v.clusterToOffset(defaultRootCluster); err == nil {
+	if offset, err := v.clusterToOffset(DefaultRootCluster); err == nil {
 		meta.Offset = offset
 	}
 	if bs := v.GetBootSector(); bs != nil {
@@ -408,7 +408,7 @@ func (v *Volume) reportFile(e DirEntry, opts ReportOptions) FATFile {
 		// that would read as a valid FAT12/16 root slot.
 		row.ParentFirstCluster = e.ParentFirstCluster
 		if e.EntryOffset >= 0 {
-			row.EntrySlotIndex = uint32(e.EntryOffset / dirEntrySize)
+			row.EntrySlotIndex = uint32(e.EntryOffset / DirEntrySize)
 		}
 	}
 	if e.Virtual {
@@ -451,7 +451,7 @@ func entryType(e DirEntry) string {
 	switch {
 	case e.Virtual:
 		return "virtual"
-	case e.Attributes&attrVolumeID != 0:
+	case e.Attributes&AttrVolumeID != 0:
 		return "volume_label"
 	case e.IsDirectory:
 		return "directory"

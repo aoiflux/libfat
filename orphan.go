@@ -181,7 +181,7 @@ func (v *Volume) ScanOrphansContext(ctx context.Context, opts OrphanScanOptions)
 	buf := make([]byte, v.bytesPerCluster)
 	last := v.maxClusterNumber()
 
-	for cluster := uint32(defaultRootCluster); cluster <= last; cluster++ {
+	for cluster := uint32(DefaultRootCluster); cluster <= last; cluster++ {
 		if err := prog.check(); err != nil {
 			result.Truncated = true
 			return result, err
@@ -312,6 +312,7 @@ func (v *Volume) orphanDirectory(
 		recoverDeletedLFN:   v.recoverDeletedLongNames,
 		mapOffset:           rangeOffsetMapper(ranges),
 		parentFirstCluster:  first,
+		recovery:            true,
 	}
 	entries := parseDirectoryEntries(data, ctx)
 	for i := range entries {
@@ -368,11 +369,11 @@ func (v *Volume) readClusterInto(buf []byte, cluster uint32) error {
 // found in. That check rejects stale copies of directory data that survive in
 // clusters the directory no longer occupies.
 func dotEntryParent(data []byte, cluster uint32) (uint32, bool) {
-	if len(data) < 2*dirEntrySize {
+	if len(data) < 2*DirEntrySize {
 		return 0, false
 	}
-	dot := data[0:dirEntrySize]
-	dotdot := data[dirEntrySize : 2*dirEntrySize]
+	dot := data[0:DirEntrySize]
+	dotdot := data[DirEntrySize : 2*DirEntrySize]
 
 	if !isDotRecord(dot, ".") || !isDotRecord(dotdot, "..") {
 		return 0, false
@@ -384,10 +385,10 @@ func dotEntryParent(data []byte, cluster uint32) (uint32, bool) {
 }
 
 func isDotRecord(entry []byte, name string) bool {
-	if entry[11]&attrDirectory == 0 {
+	if entry[11]&AttrDirectory == 0 {
 		return false
 	}
-	if entry[11]&(attrVolumeID|attrLongName) != 0 {
+	if entry[11]&(AttrVolumeID|AttrLongName) != 0 {
 		return false
 	}
 	for i := 0; i < len(name); i++ {
@@ -414,20 +415,20 @@ func entryFirstCluster(entry []byte) uint32 {
 // rate low: arbitrary file data almost always contains a byte pattern that no
 // directory entry could have.
 func looksLikeDirectoryData(data []byte, minEntries int) bool {
-	if len(data) < dirEntrySize {
+	if len(data) < DirEntrySize {
 		return false
 	}
 	valid := 0
-	for offset := 0; offset+dirEntrySize <= len(data); offset += dirEntrySize {
-		entry := data[offset : offset+dirEntrySize]
+	for offset := 0; offset+DirEntrySize <= len(data); offset += DirEntrySize {
+		entry := data[offset : offset+DirEntrySize]
 		switch {
 		case entry[0] == 0x00:
 			// Free record; the remainder of a directory cluster is zero-filled.
 			if !isZeroed(entry) {
 				return false
 			}
-		case entry[11] == attrLongName:
-			if !isValidLFNEntry(entry, entry[0] == 0xE5) {
+		case entry[11] == AttrLongName:
+			if !isValidLFNEntry(entry, entry[0] == DeletedMarker) {
 				return false
 			}
 			valid++
@@ -437,7 +438,7 @@ func looksLikeDirectoryData(data []byte, minEntries int) bool {
 			// timestamps, which the general short-entry validator rejects, so
 			// they are classified here and not counted towards minEntries.
 		default:
-			if !isValidShortEntry(entry) {
+			if !isPlausibleRecoveredEntry(entry) {
 				return false
 			}
 			valid++
@@ -501,7 +502,7 @@ func (v *Volume) walkReachable(prog *scanProgress, dir *File, depth, maxDepth in
 		if !entry.IsDirectory || entry.Deleted || entry.Virtual {
 			continue
 		}
-		if entry.FirstCluster < defaultRootCluster || entry.FirstCluster > v.maxClusterNumber() {
+		if entry.FirstCluster < DefaultRootCluster || entry.FirstCluster > v.maxClusterNumber() {
 			continue
 		}
 		if _, done := visited[entry.FirstCluster]; done {

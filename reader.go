@@ -113,7 +113,7 @@ func (f *File) fragments() (*fragmentReader, error) {
 	if f.isDir {
 		return nil, ErrNotFile
 	}
-	if f.size == 0 {
+	if f.size == 0 && !(f.volume.strict && f.firstCluster != 0) {
 		f.reader = newFragmentReader(f.volume, nil)
 		return f.reader, nil
 	}

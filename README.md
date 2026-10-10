@@ -45,6 +45,10 @@ Implemented now:
   per-row extent provenance
 - Format introspection via `Volume.Capabilities()`, so a caller handling several
   filesystems can ask what FAT records instead of special-casing on its name
+- An opt-in strict mode (`OpenOptions.Strict`) for checking volumes that are
+  meant to be well formed, and an opt-in in-memory FAT (`OpenOptions.CacheFAT`)
+- Exported codecs and on-disk constants (date and time, LFN checksum, 8.3 name
+  rules) so that FAT writers encode by the rules this library decodes by
 - Unit tests over synthetic images with explicitly chosen cluster layouts, an
   adversarial corpus, and fuzz targets asserting panic-freedom
 - Opt-in validation against real disk images and a purpose-built 14-volume
@@ -55,7 +59,8 @@ Implemented now:
 Current limitations:
 
 - Read-only library
-- No write support
+- No write support: the exported codecs encode single fields, and nothing
+  builds a volume, a FAT or a directory
 
 ## Installation
 
@@ -285,6 +290,17 @@ Volume-level:
 - `(*Volume).VolumeLabel() string` — the root directory's volume-ID record,
   falling back to the boot sector only when there is none, with
   `BootSectorVolumeLabel()` and `VolumeLabelSource()` exposing both readings
+- `(*Volume).Geometry() Geometry` — sector size, cluster size, reserved
+  sectors, FAT count and size, first FAT, root and data sectors, root cluster
+  and cluster count, so sector and cluster addresses need no second BPB parse
+- `OpenOptions.Strict` — turn the irregularities the default reading tolerates
+  (chains into free clusters or of the wrong length, broken long names,
+  misplaced `.`/`..`, case-folded duplicates, records after the end marker,
+  disagreeing FATs) into a `*StrictError` naming the check and the record;
+  `errors.Is(err, ErrStrict)`. Live tree only; a call that succeeds returns
+  exactly what it would without it
+- `OpenOptions.CacheFAT` — read each FAT copy once instead of once per lookup;
+  skipped above 256 MiB
 
 Walking the tree:
 
@@ -327,11 +343,31 @@ File-level:
 - `(*File).ReadAt(p []byte, offset int64) (int, error)`
 - `(*File).ReadAll() ([]byte, error)`
 - `(*File).ReadDir() ([]DirEntry, error)`
+- `(*File).ReadDirWithOptions(opts ReadDirOptions) ([]DirEntry, error)` —
+  `ExcludeDeleted` for the live tree only, `IncludeDotEntries` for the `.` and
+  `..` records
 - `(*File).Fragments() ([]Range, error)`
 - `(*File).IsFragmented() (bool, error)`
 - `(*File).Reader() (io.ReadSeeker, error)`, `(*File).ReaderAt() (io.ReaderAt, error)`
 - `(*File).SectionReader() (*io.SectionReader, error)` (contiguous files only)
 - `(*File).SetFragmentOptions(opts FragmentOptions)`
+
+Codecs and constants, for software that writes FAT and must agree with what
+this package reads (no volume or directory builders):
+
+- `EncodeDateTime(t time.Time) (date, clock uint16, tenths byte)` and
+  `DecodeDateTime(date, clock uint16, tenths byte) time.Time` — UTC, 10 ms,
+  clamped to 1980-2107
+- `LFNChecksum(short [11]byte) byte`, `LFNCharOffsets`, `LFNCharsPerSlot`,
+  `LFNLastFlag`, `MaxLFNSlots`, `MaxLongNameLen`
+- `ValidShortName(raw [11]byte) bool`, `ParseShortName(raw [11]byte, ntres byte) string`,
+  `IsValid83Char(b byte) bool`, `NTResLowerBase`, `NTResLowerExt`,
+  `DeletedMarker`, `KanjiE5`, `DotEntry`
+- `AttrReadOnly` … `AttrArchive`, `AttrLongName`, `DirEntrySize`,
+  `DefaultRootCluster`, `FAT12MaxClusters`, `FAT32MinClusters`, `MediaFixed`,
+  `FAT32Signature`
+- `FAT32Mask`, `FAT32EOC`, `FAT32EOCMin`, `FAT32Bad`, `FSInfoLeadSig`,
+  `FSInfoStructSig`, `FSInfoTrailSig`
 
 ## Examples
 

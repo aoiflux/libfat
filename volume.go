@@ -46,7 +46,25 @@ type Volume struct {
 	fsTypeHint          string
 	fsInfo              *FAT32FSInfo
 	fatMirrorMismatches uint64
+
+	cacheFAT bool
+	strict   bool
+	fatCache fatCache
 }
+
+// fatCache holds every FAT copy in memory once loaded. tables is nil when the
+// cache was not requested, has not been loaded yet, or could not be built; in
+// each case lookups fall through to reading the image.
+type fatCache struct {
+	once   sync.Once
+	tables [][]byte
+}
+
+// maxFATCacheBytes bounds the memory CacheFAT may take, summed across copies.
+// It admits a FAT32 volume of 32 million clusters with two FATs - a terabyte
+// of 32 KiB clusters - and refuses only the volumes where holding the FAT
+// would cost more than the reads it saves.
+const maxFATCacheBytes = 256 << 20
 
 func Open(reader io.ReaderAt) (*Volume, error) {
 	return OpenWithOptions(reader, OpenOptions{})
@@ -84,6 +102,8 @@ func OpenWithOptions(reader io.ReaderAt, options OpenOptions) (*Volume, error) {
 		includeVolumeLabelEntries: options.IncludeVolumeLabelEntries,
 		includeVirtualRootEntries: options.IncludeVirtualRootEntries,
 		recoverDeletedLongNames:   options.RecoverDeletedLongNames,
+		cacheFAT:                  options.CacheFAT,
+		strict:                    options.Strict,
 	}
 	if err := v.parseBootSector(); err != nil {
 		return nil, wrapVolumeError("open", err)
@@ -114,7 +134,7 @@ func (v *Volume) readRootVolumeLabel() string {
 		return ""
 	}
 	const maxScan = 1 << 20
-	buf := make([]byte, 32*dirEntrySize)
+	buf := make([]byte, 32*DirEntrySize)
 	var scanned int64
 	for _, run := range runs {
 		for at := run.StartByte; at < run.EndByte(); {
@@ -122,7 +142,7 @@ func (v *Volume) readRootVolumeLabel() string {
 			if chunk > int64(len(buf)) {
 				chunk = int64(len(buf))
 			}
-			chunk -= chunk % dirEntrySize
+			chunk -= chunk % DirEntrySize
 			if chunk == 0 || scanned >= maxScan {
 				return ""
 			}
@@ -131,19 +151,19 @@ func (v *Volume) readRootVolumeLabel() string {
 			}
 			scanned += chunk
 			at += chunk
-			for i := int64(0); i < chunk; i += dirEntrySize {
-				rec := buf[i : i+dirEntrySize]
+			for i := int64(0); i < chunk; i += DirEntrySize {
+				rec := buf[i : i+DirEntrySize]
 				switch {
 				case rec[0] == 0x00:
 					// End of directory: every record past here is unused.
 					return ""
-				case rec[0] == 0xE5:
+				case rec[0] == DeletedMarker:
 					continue
-				case rec[11] == attrLongName:
+				case rec[11] == AttrLongName:
 					// A long-name slot sets the volume-ID bit without being a
 					// label, so it has to be excluded before the test below.
 					continue
-				case rec[11]&attrVolumeID != 0 && rec[11]&attrDirectory == 0:
+				case rec[11]&AttrVolumeID != 0 && rec[11]&AttrDirectory == 0:
 					return parseVolumeLabel(rec, false)
 				}
 			}
@@ -291,7 +311,7 @@ func (v *Volume) applyBootSector(bs *BootSector) error {
 		fatSize = bs.FATSize32
 	}
 
-	rootDirSectors := ((uint32(bs.RootEntryCount) * dirEntrySize) + (uint32(bs.BytesPerSector) - 1)) / uint32(bs.BytesPerSector)
+	rootDirSectors := ((uint32(bs.RootEntryCount) * DirEntrySize) + (uint32(bs.BytesPerSector) - 1)) / uint32(bs.BytesPerSector)
 	firstFATSector := uint32(bs.ReservedSectors)
 	if firstFATSector > totalSectors {
 		return fmt.Errorf("%w: invalid first FAT sector %d (total sectors %d)", ErrInvalidBootSector, firstFATSector, totalSectors)
@@ -310,15 +330,15 @@ func (v *Volume) applyBootSector(bs *BootSector) error {
 	if v.forcedFATType != "" {
 		switch v.forcedFATType {
 		case FATType12:
-			if clusterCount >= fat12ClusterThreshold {
+			if clusterCount > FAT12MaxClusters {
 				return fmt.Errorf("%w: too many clusters for FAT12 (%d)", ErrInvalidBootSector, clusterCount)
 			}
 		case FATType16:
-			if clusterCount < fat12ClusterThreshold || clusterCount >= fat16ClusterThreshold {
+			if clusterCount <= FAT12MaxClusters || clusterCount >= FAT32MinClusters {
 				return fmt.Errorf("%w: cluster count %d incompatible with FAT16", ErrInvalidBootSector, clusterCount)
 			}
 		case FATType32:
-			if clusterCount < fat16ClusterThreshold {
+			if clusterCount < FAT32MinClusters {
 				return fmt.Errorf("%w: too few clusters for FAT32 (%d)", ErrInvalidBootSector, clusterCount)
 			}
 		}
@@ -337,21 +357,21 @@ func (v *Volume) applyBootSector(bs *BootSector) error {
 		}
 	}
 
-	rootCluster := uint32(defaultRootCluster)
+	rootCluster := uint32(DefaultRootCluster)
 	rootDirFirstSector := uint32(bs.ReservedSectors) + (uint32(bs.NumberOfFATs) * fatSize)
 	firstClusterSector := firstDataSector
 	if fatType == FATType32 {
 		if bs.RootEntryCount != 0 {
 			return fmt.Errorf("%w: FAT32 requires root entry count 0 (got %d)", ErrInvalidBootSector, bs.RootEntryCount)
 		}
-		if bs.RootCluster < defaultRootCluster {
+		if bs.RootCluster < DefaultRootCluster {
 			return fmt.Errorf("%w: invalid FAT32 root cluster %d", ErrInvalidBootSector, bs.RootCluster)
 		}
-		if bs.RootCluster-defaultRootCluster >= clusterCount {
+		if bs.RootCluster-DefaultRootCluster >= clusterCount {
 			return fmt.Errorf("%w: FAT32 root cluster %d outside data range", ErrInvalidBootSector, bs.RootCluster)
 		}
 		rootCluster = bs.RootCluster
-		rootDirFirstSector = firstDataSector + ((rootCluster - defaultRootCluster) * uint32(bs.SectorsPerCluster))
+		rootDirFirstSector = firstDataSector + ((rootCluster - DefaultRootCluster) * uint32(bs.SectorsPerCluster))
 		if rootDirFirstSector >= totalSectors {
 			return fmt.Errorf("%w: FAT32 root directory sector %d beyond total sectors %d", ErrInvalidBootSector, rootDirFirstSector, totalSectors)
 		}
@@ -399,9 +419,9 @@ func (v *Volume) applyBootSector(bs *BootSector) error {
 
 func fatTypeFromClusterCount(clusterCount uint32) string {
 	switch {
-	case clusterCount < fat12ClusterThreshold:
+	case clusterCount <= FAT12MaxClusters:
 		return FATType12
-	case clusterCount < fat16ClusterThreshold:
+	case clusterCount < FAT32MinClusters:
 		return FATType16
 	default:
 		return FATType32
@@ -503,6 +523,26 @@ func (v *Volume) FirstRootDirSector() uint32 {
 	return v.rootDirFirstSector
 }
 
+// Geometry returns the volume's layout; see Geometry.
+func (v *Volume) Geometry() Geometry {
+	return Geometry{
+		BytesPerSector:     v.bytesPerSector,
+		SectorsPerCluster:  v.sectorsPerCluster,
+		BytesPerCluster:    v.bytesPerCluster,
+		ReservedSectors:    v.reservedSectors,
+		NumberOfFATs:       v.numberOfFATs,
+		FATSizeSectors:     v.fatSizeSectors,
+		FirstFATSector:     v.firstFATSector,
+		RootDirFirstSector: v.rootDirFirstSector,
+		RootDirSectors:     v.rootDirSectors,
+		FirstDataSector:    v.firstDataSector,
+		RootCluster:        v.rootCluster,
+		ClusterCount:       v.clusterCount,
+		TotalSectors:       v.totalSectors,
+		BaseOffset:         v.baseOffset,
+	}
+}
+
 // BaseOffset is the byte offset within the image at which this volume begins.
 //
 // It is what every offset this library returns is measured from - a Range's
@@ -539,10 +579,10 @@ func (v *Volume) ClusterToOffset(cluster uint32) (int64, error) {
 }
 
 func (v *Volume) clusterToOffset(cluster uint32) (int64, error) {
-	if cluster < defaultRootCluster || cluster > v.maxClusterNumber() {
+	if cluster < DefaultRootCluster || cluster > v.maxClusterNumber() {
 		return 0, fmt.Errorf("%w: invalid cluster %d", ErrCorruptStructure, cluster)
 	}
-	sector := uint64(v.firstDataSector) + (uint64(cluster-defaultRootCluster) * uint64(v.sectorsPerCluster))
+	sector := uint64(v.firstDataSector) + (uint64(cluster-DefaultRootCluster) * uint64(v.sectorsPerCluster))
 	offset := sector * uint64(v.bytesPerSector)
 	if offset+uint64(v.bytesPerCluster) > v.volumeSize || offset > uint64(math.MaxInt64) {
 		return 0, fmt.Errorf("%w: cluster %d extends beyond volume", ErrCorruptStructure, cluster)
@@ -588,7 +628,15 @@ func (v *Volume) readCluster(cluster uint32) ([]byte, error) {
 }
 
 func (v *Volume) readFATEntry(cluster uint32) (uint32, error) {
-	if cluster < defaultRootCluster || cluster > v.maxClusterNumber() {
+	return v.readFATEntryMode(cluster, false)
+}
+
+// readFATEntryMode is readFATEntry with Strict's mirror check when strict is
+// set. It is a parameter rather than read from the volume because only the
+// live paths are strict: the orphan sweep and the label scan at open read the
+// same FAT tolerantly on a strict volume.
+func (v *Volume) readFATEntryMode(cluster uint32, strict bool) (uint32, error) {
+	if cluster < DefaultRootCluster || cluster > v.maxClusterNumber() {
 		return 0, fmt.Errorf("%w: FAT cluster %d out of range", ErrCorruptStructure, cluster)
 	}
 
@@ -608,6 +656,14 @@ func (v *Volume) readFATEntry(cluster uint32) (uint32, error) {
 
 	if primary != secondary {
 		atomic.AddUint64(&v.fatMirrorMismatches, 1)
+		if strict && v.fatMirrored() {
+			return 0, &StrictError{
+				Check:       StrictFATMirror,
+				EntryOffset: -1,
+				Cluster:     cluster,
+				Detail:      fmt.Sprintf("FAT #1 holds %#x, FAT #2 holds %#x", primary, secondary),
+			}
+		}
 		if !v.isPlausibleFATValue(primary) && v.isPlausibleFATValue(secondary) {
 			return secondary, nil
 		}
@@ -616,35 +672,38 @@ func (v *Volume) readFATEntry(cluster uint32) (uint32, error) {
 	return primary, nil
 }
 
+// fatMirrored reports whether the volume's FAT copies are meant to be kept
+// identical. FAT32 can switch mirroring off with bit 7 of BPB_ExtFlags, after
+// which only the active copy is maintained and the others may legitimately
+// differ from it.
+func (v *Volume) fatMirrored() bool {
+	if v.numberOfFATs < 2 {
+		return false
+	}
+	return v.fatType != FATType32 || v.bootSector == nil || v.bootSector.ExtFlags&0x80 == 0
+}
+
 func (v *Volume) readFATEntryFromTable(cluster, table uint32) (uint32, error) {
-	if cluster < defaultRootCluster || cluster > v.maxClusterNumber() {
+	if cluster < DefaultRootCluster || cluster > v.maxClusterNumber() {
 		return 0, fmt.Errorf("%w: FAT cluster %d out of range", ErrCorruptStructure, cluster)
 	}
 	if table >= v.numberOfFATs {
 		return 0, fmt.Errorf("%w: FAT table index %d out of range", ErrCorruptStructure, table)
 	}
 
-	var entryOffset uint32
-	var entrySize uint32
-
-	switch v.fatType {
-	case FATType12:
-		entryOffset = cluster + (cluster / 2)
-		entrySize = 2
-	case FATType16:
-		entryOffset = cluster * 2
-		entrySize = 2
-	case FATType32:
-		entryOffset = cluster * 4
-		entrySize = 4
-	default:
-		return 0, fmt.Errorf("%w: %s", ErrUnsupportedFAT, v.fatType)
+	entryOffset, entrySize, err := v.fatEntryLocation(cluster)
+	if err != nil {
+		return 0, err
 	}
 
 	fatByteLen := v.fatSizeSectors * v.bytesPerSector
 	if entryOffset+entrySize > fatByteLen {
 		return 0, fmt.Errorf("%w: FAT entry crosses FAT bounds (cluster=%d, offset=%d, size=%d, fatBytes=%d)",
 			ErrCorruptStructure, cluster, entryOffset, entrySize, fatByteLen)
+	}
+
+	if tables := v.cachedFATTables(); tables != nil {
+		return v.decodeFATEntry(tables[table][entryOffset:entryOffset+entrySize], cluster)
 	}
 
 	buf := make([]byte, entrySize)
@@ -657,7 +716,27 @@ func (v *Volume) readFATEntryFromTable(cluster, table uint32) (uint32, error) {
 	if n != len(buf) {
 		return 0, fmt.Errorf("%w: short FAT entry read at offset %d", ErrCorruptStructure, fatOffset)
 	}
+	return v.decodeFATEntry(buf, cluster)
+}
 
+// fatEntryLocation returns the byte offset of cluster's entry within one FAT
+// copy and the number of bytes that must be read to decode it.
+func (v *Volume) fatEntryLocation(cluster uint32) (offset, size uint32, err error) {
+	switch v.fatType {
+	case FATType12:
+		return cluster + (cluster / 2), 2, nil
+	case FATType16:
+		return cluster * 2, 2, nil
+	case FATType32:
+		return cluster * 4, 4, nil
+	default:
+		return 0, 0, fmt.Errorf("%w: %s", ErrUnsupportedFAT, v.fatType)
+	}
+}
+
+// decodeFATEntry decodes the entry for cluster from buf, which holds exactly
+// the bytes fatEntryLocation names.
+func (v *Volume) decodeFATEntry(buf []byte, cluster uint32) (uint32, error) {
 	switch v.fatType {
 	case FATType12:
 		value := binary.LittleEndian.Uint16(buf)
@@ -668,17 +747,53 @@ func (v *Volume) readFATEntryFromTable(cluster, table uint32) (uint32, error) {
 	case FATType16:
 		return uint32(binary.LittleEndian.Uint16(buf)), nil
 	case FATType32:
-		return binary.LittleEndian.Uint32(buf) & 0x0FFFFFFF, nil
+		return binary.LittleEndian.Uint32(buf) & FAT32Mask, nil
 	default:
 		return 0, fmt.Errorf("%w: %s", ErrUnsupportedFAT, v.fatType)
 	}
+}
+
+// cachedFATTables returns every FAT copy held in memory, loading them on the
+// first call, or nil when lookups must read the image instead. A volume opened
+// without CacheFAT never loads anything.
+func (v *Volume) cachedFATTables() [][]byte {
+	if !v.cacheFAT {
+		return nil
+	}
+	v.fatCache.once.Do(func() {
+		v.fatCache.tables = v.loadFATTables()
+	})
+	return v.fatCache.tables
+}
+
+// loadFATTables reads every FAT copy in full. It returns nil, so that lookups
+// read entry by entry as they always have, when the copies are too large to be
+// worth holding or when any of them cannot be read whole: a cache that covered
+// only part of a table would make the same lookup succeed or fail depending on
+// whether the cache had been built.
+func (v *Volume) loadFATTables() [][]byte {
+	tableBytes := int64(v.fatSizeSectors) * int64(v.bytesPerSector)
+	if tableBytes <= 0 || tableBytes*int64(v.numberOfFATs) > maxFATCacheBytes {
+		return nil
+	}
+	tables := make([][]byte, v.numberOfFATs)
+	for table := uint32(0); table < v.numberOfFATs; table++ {
+		buf := make([]byte, tableBytes)
+		start := v.abs(int64(v.firstFATSector+table*v.fatSizeSectors) * int64(v.bytesPerSector))
+		n, err := v.reader.ReadAt(buf, start)
+		if n != len(buf) || (err != nil && err != io.EOF) {
+			return nil
+		}
+		tables[table] = buf
+	}
+	return tables
 }
 
 func (v *Volume) isPlausibleFATValue(value uint32) bool {
 	if value == 0 || v.isBadCluster(value) || v.isEndOfChain(value) {
 		return true
 	}
-	return value >= defaultRootCluster && value <= v.maxClusterNumber()
+	return value >= DefaultRootCluster && value <= v.maxClusterNumber()
 }
 
 func (v *Volume) isEndOfChain(value uint32) bool {
@@ -688,7 +803,7 @@ func (v *Volume) isEndOfChain(value uint32) bool {
 	case FATType16:
 		return value >= 0xFFF8
 	case FATType32:
-		return value >= 0x0FFFFFF8
+		return value >= FAT32EOCMin
 	default:
 		return true
 	}
@@ -701,14 +816,20 @@ func (v *Volume) isBadCluster(value uint32) bool {
 	case FATType16:
 		return value == 0xFFF7
 	case FATType32:
-		return value == 0x0FFFFFF7
+		return value == FAT32Bad
 	default:
 		return false
 	}
 }
 
 func (v *Volume) clusterChain(startCluster uint32) ([]uint32, error) {
-	if startCluster < defaultRootCluster || startCluster > v.maxClusterNumber() {
+	return v.clusterChainMode(startCluster, false)
+}
+
+// clusterChainMode is clusterChain, failing with a StrictError where Strict
+// requires when strict is set.
+func (v *Volume) clusterChainMode(startCluster uint32, strict bool) ([]uint32, error) {
+	if startCluster < DefaultRootCluster || startCluster > v.maxClusterNumber() {
 		return nil, fmt.Errorf("%w: invalid cluster %d", ErrCorruptStructure, startCluster)
 	}
 
@@ -716,35 +837,52 @@ func (v *Volume) clusterChain(startCluster uint32) ([]uint32, error) {
 	chain := make([]uint32, 0, 4)
 	current := startCluster
 
+	// Under Strict each failure is a StrictError naming the cluster; the record
+	// that owns the chain is filled in by the caller, which knows it.
+	corrupt := func(cluster uint32, err error) error {
+		if !strict {
+			return err
+		}
+		return &StrictError{Check: StrictChainCorrupt, EntryOffset: -1, Cluster: cluster, Err: err}
+	}
+
 	for {
 		if _, ok := seen[current]; ok {
-			return nil, fmt.Errorf("%w: cluster loop at %d", ErrCorruptStructure, current)
+			return nil, corrupt(current, fmt.Errorf("%w: cluster loop at %d", ErrCorruptStructure, current))
 		}
 		seen[current] = struct{}{}
 		chain = append(chain, current)
 
-		next, err := v.readFATEntry(current)
+		next, err := v.readFATEntryMode(current, strict)
 		if err != nil {
 			return nil, err
 		}
 		if next == 0 {
+			if strict {
+				return nil, &StrictError{
+					Check:       StrictChainFreeCluster,
+					EntryOffset: -1,
+					Cluster:     current,
+					Detail:      fmt.Sprintf("chain runs into a free cluster after %d clusters", len(chain)),
+				}
+			}
 			return chain, nil
 		}
 		if v.isBadCluster(next) {
-			return nil, fmt.Errorf("%w: bad cluster %d", ErrCorruptStructure, next)
+			return nil, corrupt(current, fmt.Errorf("%w: bad cluster %d", ErrCorruptStructure, next))
 		}
 		if v.isEndOfChain(next) {
 			return chain, nil
 		}
-		if next < defaultRootCluster || next >= v.clusterCount+defaultRootCluster {
-			return nil, fmt.Errorf("%w: next cluster %d out of range", ErrCorruptStructure, next)
+		if next < DefaultRootCluster || next >= v.clusterCount+DefaultRootCluster {
+			return nil, corrupt(current, fmt.Errorf("%w: next cluster %d out of range", ErrCorruptStructure, next))
 		}
 		current = next
 	}
 }
 
-func (v *Volume) readClusterChain(startCluster uint32, sizeHint int64) ([]byte, error) {
-	chain, err := v.clusterChain(startCluster)
+func (v *Volume) readClusterChain(startCluster uint32, sizeHint int64, strict bool) ([]byte, error) {
+	chain, err := v.clusterChainMode(startCluster, strict)
 	if err != nil {
 		return nil, err
 	}
@@ -764,15 +902,15 @@ func (v *Volume) readClusterChain(startCluster uint32, sizeHint int64) ([]byte, 
 	return buf, nil
 }
 
-func (v *Volume) readRootDirectoryData() ([]byte, error) {
+func (v *Volume) readRootDirectoryData(strict bool) ([]byte, error) {
 	if v.fatType == FATType32 {
-		return v.readClusterChain(v.rootCluster, -1)
+		return v.readClusterChain(v.rootCluster, -1, strict)
 	}
 	return v.readSectors(v.rootDirFirstSector, v.rootDirSectors)
 }
 
 func (v *Volume) IsClusterAllocated(cluster uint32) (bool, error) {
-	if cluster < defaultRootCluster {
+	if cluster < DefaultRootCluster {
 		return false, nil
 	}
 	if cluster > v.maxClusterNumber() {
@@ -791,9 +929,9 @@ func (v *Volume) FATMirrorMismatches() uint64 {
 
 func (v *Volume) maxClusterNumber() uint32 {
 	if v.clusterCount == 0 {
-		return defaultRootCluster - 1
+		return DefaultRootCluster - 1
 	}
-	return defaultRootCluster + v.clusterCount - 1
+	return DefaultRootCluster + v.clusterCount - 1
 }
 
 func (v *Volume) readFAT32FSInfo(bs *BootSector) (*FAT32FSInfo, error) {
@@ -823,9 +961,9 @@ func (v *Volume) readFAT32FSInfo(bs *BootSector) (*FAT32FSInfo, error) {
 		TrailSignature:     ReadUint32LE(buf, 508),
 	}
 
-	info.Valid = info.LeadSignature == 0x41615252 &&
-		info.StructureSignature == 0x61417272 &&
-		info.TrailSignature == 0xAA550000
+	info.Valid = info.LeadSignature == FSInfoLeadSig &&
+		info.StructureSignature == FSInfoStructSig &&
+		info.TrailSignature == FSInfoTrailSig
 
 	return info, nil
 }

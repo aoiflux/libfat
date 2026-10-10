@@ -18,7 +18,7 @@ import (
 const bootSectorFixtureLabel = "TESTVOL"
 
 func labelEntry(name string) []byte {
-	return makeTimestampedEntry(name, "", attrVolumeID, 0, 0)
+	return makeTimestampedEntry(name, "", AttrVolumeID, 0, 0)
 }
 
 func TestVolumeLabelPrefersRootDirectoryRecord(t *testing.T) {
@@ -98,7 +98,7 @@ func TestVolumeLabelIgnoresDeletedRecord(t *testing.T) {
 // past one would be reading whatever happened to be in free space.
 func TestVolumeLabelStopsAtEndOfDirectory(t *testing.T) {
 	im := newTestImage(t, FATType16)
-	im.addRootRaw(make([]byte, dirEntrySize), labelEntry("PASTEND"))
+	im.addRootRaw(make([]byte, DirEntrySize), labelEntry("PASTEND"))
 
 	v := im.volume()
 	defer v.Close()

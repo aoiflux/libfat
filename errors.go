@@ -39,6 +39,113 @@ var (
 	ErrNoDataClusters = errors.New("entry has no data clusters")
 )
 
+// ErrStrict is matched by every *StrictError, so errors.Is(err, ErrStrict)
+// tells a strict violation from an I/O failure or an unusable volume.
+var ErrStrict = errors.New("strict check failed")
+
+// StrictCheck names the rule a StrictError reports a violation of.
+type StrictCheck string
+
+const (
+	// StrictChainFreeCluster: a chain reached a cluster whose FAT entry is
+	// free (0) before an end-of-chain marker. Without Strict the chain simply
+	// ends there.
+	StrictChainFreeCluster StrictCheck = "chain-free-cluster"
+	// StrictChainCorrupt: a chain loops, reaches a bad-cluster marker, or names
+	// a cluster outside the data area, or an entry's first cluster is outside
+	// it.
+	StrictChainCorrupt StrictCheck = "chain-corrupt"
+	// StrictChainLength: a file's chain holds a different number of clusters
+	// from the ceil(size/cluster size) its entry's size requires. Without
+	// Strict a long chain is trimmed silently and a short one is
+	// ErrTruncatedChain alongside the bytes it does hold.
+	StrictChainLength StrictCheck = "chain-length"
+	// StrictLFNSequence: long-name slots are out of order, lack the slot
+	// carrying LFNLastFlag, stop before ordinal 1, are not followed by their
+	// short entry, or are not valid slots. Without Strict the entry falls back
+	// to its 8.3 name.
+	StrictLFNSequence StrictCheck = "lfn-sequence"
+	// StrictLFNChecksum: a slot's checksum differs from the other slots' or
+	// from LFNChecksum of the short entry it precedes.
+	StrictLFNChecksum StrictCheck = "lfn-checksum"
+	// StrictDotEntries: a subdirectory does not begin with "." pointing at
+	// itself and then "..", or a "." or ".." record appears anywhere else,
+	// including anywhere in the root.
+	StrictDotEntries StrictCheck = "dot-entries"
+	// StrictDuplicateName: two live entries in one directory have names, long
+	// or short, that are equal under case folding.
+	StrictDuplicateName StrictCheck = "duplicate-name"
+	// StrictAfterEndMarker: a record that is not deleted follows the 0x00
+	// record that ends the directory. Without Strict it is ignored.
+	StrictAfterEndMarker StrictCheck = "after-end-marker"
+	// StrictInvalidEntry: a live record is not a valid short entry - a bad
+	// attribute byte, a name with illegal characters, a size with no cluster.
+	// Without Strict it is skipped.
+	StrictInvalidEntry StrictCheck = "invalid-entry"
+	// StrictFATMirror: the copies of the FAT disagree about a cluster.
+	// Without Strict the first copy is used, unless only the second holds a
+	// plausible value, and the disagreement is counted by
+	// Volume.FATMirrorMismatches.
+	StrictFATMirror StrictCheck = "fat-mirror"
+)
+
+// StrictError reports a structure that OpenOptions.Strict rejects and the
+// default, tolerant reading would have accepted or repaired.
+//
+// DirCluster and EntryOffset locate the 32-byte record the violation was found
+// at, in the same terms as DirEntry.ParentFirstCluster and EntryOffset: the
+// first cluster of the directory holding it (FixedRootCluster for the FAT12
+// and FAT16 root region) and the record's offset within that directory's data.
+// For a chain the record is the entry that owns the chain. EntryOffset is -1
+// when no record is to blame, as for the root directory's own chain or a FAT
+// mirror disagreement found outside any walk.
+type StrictError struct {
+	Check       StrictCheck
+	DirCluster  uint32
+	EntryOffset int64
+	// Cluster is the cluster at which a chain or FAT check failed, and 0 for
+	// checks that are not about a cluster.
+	Cluster uint32
+	Detail  string
+	// Err is the underlying error where there is one, such as
+	// ErrCorruptStructure for a loop or ErrTruncatedChain for a short chain.
+	Err error
+}
+
+func (e *StrictError) Error() string {
+	msg := fmt.Sprintf("strict %s at directory cluster %d, entry offset %d", e.Check, e.DirCluster, e.EntryOffset)
+	if e.Cluster != 0 {
+		msg += fmt.Sprintf(", cluster %d", e.Cluster)
+	}
+	if e.Detail != "" {
+		msg += ": " + e.Detail
+	}
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg
+}
+
+// Unwrap returns ErrStrict and, when set, Err, so that errors.Is matches
+// either.
+func (e *StrictError) Unwrap() []error {
+	if e.Err == nil {
+		return []error{ErrStrict}
+	}
+	return []error{ErrStrict, e.Err}
+}
+
+// atEntry places a violation found without knowing which record was to blame
+// - a chain walk, a FAT lookup - at the record of the entry that owns it,
+// unless it has already been placed.
+func (e *StrictError) atEntry(dirCluster uint32, entryOffset int64) *StrictError {
+	if e.EntryOffset < 0 && e.DirCluster == 0 {
+		e.DirCluster = dirCluster
+		e.EntryOffset = entryOffset
+	}
+	return e
+}
+
 type VolumeError struct {
 	Op  string
 	Err error

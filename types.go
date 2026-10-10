@@ -45,6 +45,40 @@ type FAT32FSInfo struct {
 	Valid              bool   `json:"valid"`
 }
 
+// Geometry is the volume's layout as the boot sector describes it, with the
+// derived values worked out once, so that a caller can compute sector and
+// cluster addresses without parsing the BPB again.
+//
+// Sector numbers are relative to the start of the volume, as the boot sector
+// states them. Multiply by BytesPerSector and add BaseOffset for an offset in
+// the image. Cluster N, from DefaultRootCluster up, begins at sector
+// FirstDataSector + (N-2)*SectorsPerCluster.
+type Geometry struct {
+	BytesPerSector    uint32 `json:"bytes_per_sector"`
+	SectorsPerCluster uint32 `json:"sectors_per_cluster"`
+	BytesPerCluster   uint32 `json:"bytes_per_cluster"`
+	ReservedSectors   uint32 `json:"reserved_sectors"`
+	NumberOfFATs      uint32 `json:"number_of_fats"`
+	// FATSizeSectors is the size of one FAT copy. Copy i begins at sector
+	// FirstFATSector + i*FATSizeSectors.
+	FATSizeSectors uint32 `json:"fat_size_sectors"`
+	FirstFATSector uint32 `json:"first_fat_sector"`
+	// RootDirFirstSector is the first sector of the root directory: the fixed
+	// root region on FAT12 and FAT16, and the root cluster's first sector on
+	// FAT32.
+	RootDirFirstSector uint32 `json:"root_dir_first_sector"`
+	// RootDirSectors is the size of the fixed root region, and 0 on FAT32.
+	RootDirSectors  uint32 `json:"root_dir_sectors"`
+	FirstDataSector uint32 `json:"first_data_sector"`
+	// RootCluster is the root directory's first cluster on FAT32. On FAT12 and
+	// FAT16 the root is not cluster-addressed and this is DefaultRootCluster.
+	RootCluster  uint32 `json:"root_cluster"`
+	ClusterCount uint32 `json:"cluster_count"`
+	TotalSectors uint32 `json:"total_sectors"`
+	// BaseOffset is the image offset of sector 0; see Volume.BaseOffset.
+	BaseOffset int64 `json:"base_offset"`
+}
+
 type OpenOptions struct {
 	FATType                   string `json:"fat_type,omitempty"`
 	IncludeVolumeLabelEntries bool   `json:"include_volume_label_entries"`
@@ -76,6 +110,33 @@ type OpenOptions struct {
 	// It must not be negative. The zero value reproduces the behaviour of every
 	// release before v0.3.1 exactly.
 	BaseOffset int64 `json:"base_offset"`
+
+	// CacheFAT reads each FAT copy into memory once, on the first lookup, and
+	// serves every later lookup from there. Without it each step of a chain
+	// costs one read per FAT copy, and so does each entry ReadDir lists, which on
+	// a volume of small clusters turns reading one large file into tens of
+	// thousands of reads.
+	//
+	// It costs memory equal to the FAT copies it holds. When they total more
+	// than 256 MiB, or cannot be read in full, the cache is not built and
+	// lookups read the image as they do without it; nothing else changes. FAT
+	// mirror mismatches are counted exactly as they are without the cache.
+	CacheFAT bool `json:"cache_fat"`
+
+	// Strict turns structural irregularities the default reading tolerates
+	// into errors: a chain that runs into a free cluster or differs in length
+	// from its entry's size, a broken long-name sequence, misplaced "." or ".."
+	// records, case-insensitive duplicate names, live records after the
+	// end-of-directory marker, records that do not parse, and disagreeing FAT
+	// copies. Each is reported as a *StrictError locating the record at fault.
+	//
+	// It is for checking volumes that are meant to be well formed, such as a
+	// writer's own output. It applies only to the live tree: deleted records,
+	// orphan recovery and the label scan at open are read tolerantly whatever
+	// it is set to. It never changes what a successful call returns, only
+	// whether the call succeeds. See the package documentation's Strict mode
+	// section for where each check runs.
+	Strict bool `json:"strict"`
 }
 
 // NameSource records how a DirEntry's Name was determined.

@@ -265,7 +265,7 @@ func (w *fatWalk) report(entries []DirEntry, parent uint32, depth int) error {
 		if depth+1 >= w.maxDepth {
 			continue
 		}
-		if e.FirstCluster < defaultRootCluster || e.FirstCluster > w.v.maxClusterNumber() {
+		if e.FirstCluster < DefaultRootCluster || e.FirstCluster > w.v.maxClusterNumber() {
 			continue
 		}
 		if _, done := w.seen[e.FirstCluster]; done {

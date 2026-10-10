@@ -191,7 +191,7 @@ func TestFileIDSlotIndexMatchesEntryOffset(t *testing.T) {
 
 	for _, e := range subdirEntries(t, v, "/SUB") {
 		id := mustFileID(t, v, e)
-		if want := uint32(e.EntryOffset / dirEntrySize); id.EntrySlotIndex != want {
+		if want := uint32(e.EntryOffset / DirEntrySize); id.EntrySlotIndex != want {
 			t.Fatalf("%s: EntrySlotIndex = %d, want %d", e.Name, id.EntrySlotIndex, want)
 		}
 	}

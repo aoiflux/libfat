@@ -628,7 +628,7 @@ func TestReadDirSkipsVolumeLabelByDefault(t *testing.T) {
 	img := makeFAT16DirectoryImage(t)
 	rootOffset := 41 * 512
 	entries := img[rootOffset : rootOffset+1024]
-	copy(entries[128:160], makeShortEntry("MYLABEL", "", attrVolumeID, 0, 0))
+	copy(entries[128:160], makeShortEntry("MYLABEL", "", AttrVolumeID, 0, 0))
 	entries[160] = 0x00
 
 	v, err := Open(&mockReaderAt{data: img})
@@ -655,7 +655,7 @@ func TestReadDirIncludesVolumeLabelWhenEnabled(t *testing.T) {
 	img := makeFAT16DirectoryImage(t)
 	rootOffset := 41 * 512
 	entries := img[rootOffset : rootOffset+1024]
-	copy(entries[128:160], makeShortEntry("MYLABEL", "", attrVolumeID, 0, 0))
+	copy(entries[128:160], makeShortEntry("MYLABEL", "", AttrVolumeID, 0, 0))
 	entries[160] = 0x00
 
 	v, err := OpenWithOptions(&mockReaderAt{data: img}, OpenOptions{IncludeVolumeLabelEntries: true})
@@ -1137,7 +1137,7 @@ func makeLFNEntries(name, shortName string) [][]byte {
 			seq |= 0x40
 		}
 		entry[0] = seq
-		entry[11] = attrLongName
+		entry[11] = AttrLongName
 		entry[13] = checksum
 		writeLFNPart(entry, part)
 		entries = append(entries, entry)

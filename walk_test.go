@@ -209,7 +209,7 @@ func deletedDirImage(t *testing.T) *testImage {
 
 	// A record in the second cluster of the run, reachable only by assuming
 	// contiguity or by walking a chain that no longer exists.
-	second := make([]byte, dirEntrySize)
+	second := make([]byte, DirEntrySize)
 	copy(second, makeTimestampedEntry("SECOND", "TXT", 0x20, 26, 10))
 	im.writeRawCluster(21, second)
 	return im
