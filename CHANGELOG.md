@@ -7,6 +7,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.2] - 2026-10-11
+
 The Go API is additive: no exported symbol was removed, renamed, or
 re-signatured, and no JSON key was removed or renamed. Every new option is off
 in the zero `OpenOptions`.

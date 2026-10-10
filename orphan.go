@@ -435,7 +435,7 @@ func looksLikeDirectoryData(data []byte, minEntries int) bool {
 		case isDotRecord(entry, "."), isDotRecord(entry, ".."):
 			// The dot records are structural rather than content. ".." in a
 			// directory directly below the root carries cluster 0 and no
-			// timestamps, which the general short-entry validator rejects, so
+			// timestamps, which isPlausibleRecoveredEntry rejects, so
 			// they are classified here and not counted towards minEntries.
 		default:
 			if !isPlausibleRecoveredEntry(entry) {
