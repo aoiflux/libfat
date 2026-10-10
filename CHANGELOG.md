@@ -125,6 +125,13 @@ whose records carry no timestamps, which it used to drop. It is described under
   `TestRealWindowsVolumePassesStrict` holds the Windows-written partition to
   Strict. Both are skipped unless `LIBFAT_TEST_IMAGES` is set.
 
+### CI
+
+- The staticcheck job pins Go `1.26.x` and staticcheck `v0.8.1`. It used to
+  float both (`stable` and `@latest`) and broke when go1.27.2 changed the
+  compiler's export data to a format staticcheck v0.8.1 cannot decode. No
+  library code was at fault. The test jobs still track stable Go.
+
 ## [0.3.1] - 2026-09-16
 
 The Go API is additive: no exported symbol was removed, renamed, or

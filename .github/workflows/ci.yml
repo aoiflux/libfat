@@ -60,11 +60,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # staticcheck reads the compiler's export data and must know its format.
+      # Floating both Go (stable) and staticcheck (latest) broke this job when
+      # go1.27.2 shipped a format staticcheck v0.8.1 cannot decode. Pin the pair
+      # and move them together; the test jobs above still track stable Go.
       - uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version: '1.26.x'
           check-latest: true
       - name: Install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+        run: go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
       - name: Run staticcheck
         run: staticcheck ./...
