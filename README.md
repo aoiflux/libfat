@@ -299,6 +299,9 @@ Volume-level:
   disagreeing FATs) into a `*StrictError` naming the check and the record;
   `errors.Is(err, ErrStrict)`. Live tree only; a call that succeeds returns
   exactly what it would without it
+- `OpenOptions.StrictSkipFATMirror` — leave the FAT #1 vs #2 comparison out of
+  Strict while keeping every other check; mismatches are still counted by
+  `FATMirrorMismatches()`
 - `OpenOptions.CacheFAT` — read each FAT copy once instead of once per lookup;
   skipped above 256 MiB
 

@@ -69,7 +69,8 @@ const (
 	// from LFNChecksum of the short entry it precedes.
 	StrictLFNChecksum StrictCheck = "lfn-checksum"
 	// StrictDotEntries: a subdirectory does not begin with "." pointing at
-	// itself and then "..", or a "." or ".." record appears anywhere else,
+	// itself and then ".." pointing at its parent (0 when the parent is the
+	// root, on every FAT type), or a "." or ".." record appears anywhere else,
 	// including anywhere in the root.
 	StrictDotEntries StrictCheck = "dot-entries"
 	// StrictDuplicateName: two live entries in one directory have names, long
@@ -85,7 +86,8 @@ const (
 	// StrictFATMirror: the copies of the FAT disagree about a cluster.
 	// Without Strict the first copy is used, unless only the second holds a
 	// plausible value, and the disagreement is counted by
-	// Volume.FATMirrorMismatches.
+	// Volume.FATMirrorMismatches. OpenOptions.StrictSkipFATMirror turns this
+	// one check off.
 	StrictFATMirror StrictCheck = "fat-mirror"
 )
 

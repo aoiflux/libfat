@@ -2,7 +2,7 @@ package libfat
 
 const (
 	// Version is the current library version.
-	Version = "0.3.2"
+	Version = "0.3.3"
 
 	// Author describes the library maintainers.
 	Author = "libfat contributors"

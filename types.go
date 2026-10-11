@@ -137,6 +137,14 @@ type OpenOptions struct {
 	// whether the call succeeds. See the package documentation's Strict mode
 	// section for where each check runs.
 	Strict bool `json:"strict"`
+
+	// StrictSkipFATMirror leaves the FAT mirror comparison out of Strict, for
+	// volumes whose FAT copies are known to differ - one written by a tool
+	// that maintains only the first copy, say - but whose structure should
+	// otherwise be held to Strict. Disagreements are still counted by
+	// Volume.FATMirrorMismatches, and the first copy is still preferred as it
+	// is without Strict. It has no effect unless Strict is set.
+	StrictSkipFATMirror bool `json:"strict_skip_fat_mirror"`
 }
 
 // NameSource records how a DirEntry's Name was determined.

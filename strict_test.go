@@ -476,6 +476,29 @@ func TestStrictFATMirror(t *testing.T) {
 		t.Fatal("Strict changed the orphan sweep")
 	}
 
+	// StrictSkipFATMirror takes the comparison out of Strict but still counts
+	// the disagreement, and leaves every other strict check in force.
+	t.Run("StrictSkipFATMirror", func(t *testing.T) {
+		skip := OpenOptions{Strict: true, StrictSkipFATMirror: true}
+		v := im.volumeWithOptions(skip)
+		if _, err := readRoot(t, v); err != nil {
+			t.Fatalf("ReadDir: %v", err)
+		}
+		if _, err := readAllPath(v, "/A.BIN"); err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+		if v.FATMirrorMismatches() == 0 {
+			t.Fatal("the mismatch was not counted")
+		}
+
+		broken := newTestImage(t, FATType32)
+		broken.addFile(testFile{base: "A", ext: "BIN", clusters: []uint32{5, 6}, size: 1024, terminate: true})
+		diverge(broken, 5, FAT32EOC)
+		broken.setFATEntry(6, 0)
+		_, err := readAllPath(broken.volumeWithOptions(skip), "/A.BIN")
+		requireStrict(t, err, StrictChainFreeCluster, 2, 0)
+	})
+
 	// With mirroring switched off in BPB_ExtFlags the copies may differ.
 	im.data[40] |= 0x80
 	if _, err := readAllPath(strictVolume(t, im), "/A.BIN"); err != nil {

@@ -85,9 +85,15 @@ func LFNChecksum(short [11]byte) byte {
 //
 // Space is valid, because it is how both fields are padded; a writer
 // generating a short name strips spaces from the basis first. Bytes from 0x80
-// up are valid in the 8-byte base, where they are OEM code-page characters.
-// The dot is not valid: it separates base from extension when a name is
-// displayed and is never stored, except in the "." and ".." records.
+// up are valid in both the base and the extension, as OEM code-page
+// characters, as Windows accepts them. The dot is not valid: it separates base
+// from extension when a name is displayed and is never stored, except in the
+// "." and ".." records.
+//
+// It judges one byte. Whether a whole name is accepted is ValidShortName's
+// question, and that rule is stricter in one place: it rejects bytes from 0x7F
+// up in the extension, so a name passing IsValid83Char byte by byte can still
+// fail ValidShortName.
 func IsValid83Char(b byte) bool {
 	return isValid83Char(b, false)
 }
@@ -96,7 +102,8 @@ func IsValid83Char(b byte) bool {
 // would. A leading KanjiE5 becomes 0xE5, trailing spaces are trimmed from base
 // and extension, the two are joined with '.' when the extension is not empty,
 // and ntres - the entry's byte 12 - lower-cases the base under NTResLowerBase
-// and the extension under NTResLowerExt.
+// and the extension under NTResLowerExt. Only the ASCII letters A-Z are
+// lowered, as Windows does; every other byte is left as stored.
 //
 // Bytes are not translated from any code page: a byte from 0x80 up comes back
 // as that byte. raw is taken to be live, so a leading DeletedMarker is not

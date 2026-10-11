@@ -217,12 +217,12 @@ func (v *Volume) ScanOrphansContext(ctx context.Context, opts OrphanScanOptions)
 		}
 		result.ClustersScanned++
 
-		parent, hasDots := dotEntryParent(buf, cluster)
+		parent, hasDots := dotEntryParent(buf, cluster, v.fatType == FATType32)
 		if !hasDots {
 			if !opts.AllowMissingDotEntries {
 				continue
 			}
-			if !looksLikeDirectoryData(buf, minEntries) {
+			if !looksLikeDirectoryData(buf, minEntries, v.fatType == FATType32) {
 				continue
 			}
 		}
@@ -283,7 +283,7 @@ func (v *Volume) gatherOrphanDirectory(
 			// A continuation cluster carries no "." records, so it is accepted
 			// only on the shape of its records, and only while it still holds
 			// entries: the zero-filled tail of a directory ends the run.
-			if !looksLikeDirectoryData(buf, minEntries) {
+			if !looksLikeDirectoryData(buf, minEntries, v.fatType == FATType32) {
 				break
 			}
 			data = append(data, buf...)
@@ -312,6 +312,7 @@ func (v *Volume) orphanDirectory(
 		recoverDeletedLFN:   v.recoverDeletedLongNames,
 		mapOffset:           rangeOffsetMapper(ranges),
 		parentFirstCluster:  first,
+		fat32:               v.fatType == FATType32,
 		recovery:            true,
 	}
 	entries := parseDirectoryEntries(data, ctx)
@@ -368,7 +369,7 @@ func (v *Volume) readClusterInto(buf []byte, cluster uint32) error {
 // The "." record's own cluster field must point at the cluster the record was
 // found in. That check rejects stale copies of directory data that survive in
 // clusters the directory no longer occupies.
-func dotEntryParent(data []byte, cluster uint32) (uint32, bool) {
+func dotEntryParent(data []byte, cluster uint32, fat32 bool) (uint32, bool) {
 	if len(data) < 2*DirEntrySize {
 		return 0, false
 	}
@@ -378,10 +379,10 @@ func dotEntryParent(data []byte, cluster uint32) (uint32, bool) {
 	if !isDotRecord(dot, ".") || !isDotRecord(dotdot, "..") {
 		return 0, false
 	}
-	if entryFirstCluster(dot) != cluster {
+	if entryFirstCluster(dot, fat32) != cluster {
 		return 0, false
 	}
-	return entryFirstCluster(dotdot), true
+	return entryFirstCluster(dotdot, fat32), true
 }
 
 func isDotRecord(entry []byte, name string) bool {
@@ -404,8 +405,15 @@ func isDotRecord(entry []byte, name string) bool {
 	return true
 }
 
-func entryFirstCluster(entry []byte) uint32 {
-	return uint32(ReadUint16LE(entry, 26)) | (uint32(ReadUint16LE(entry, 20)) << 16)
+// entryFirstCluster decodes a short entry's first cluster. Bytes 20-21 hold
+// its high word only on FAT32; on FAT12 and FAT16 they are the OS/2
+// extended-attribute index, and reading them as a cluster would move the file.
+func entryFirstCluster(entry []byte, fat32 bool) uint32 {
+	cluster := uint32(ReadUint16LE(entry, 26))
+	if fat32 {
+		cluster |= uint32(ReadUint16LE(entry, 20)) << 16
+	}
+	return cluster
 }
 
 // looksLikeDirectoryData reports whether every record in the buffer parses as a
@@ -414,7 +422,7 @@ func entryFirstCluster(entry []byte) uint32 {
 // Requiring that no record fails to classify is what keeps the false-positive
 // rate low: arbitrary file data almost always contains a byte pattern that no
 // directory entry could have.
-func looksLikeDirectoryData(data []byte, minEntries int) bool {
+func looksLikeDirectoryData(data []byte, minEntries int, fat32 bool) bool {
 	if len(data) < DirEntrySize {
 		return false
 	}
@@ -438,7 +446,7 @@ func looksLikeDirectoryData(data []byte, minEntries int) bool {
 			// timestamps, which isPlausibleRecoveredEntry rejects, so
 			// they are classified here and not counted towards minEntries.
 		default:
-			if !isPlausibleRecoveredEntry(entry) {
+			if !isPlausibleRecoveredEntry(entry, fat32) {
 				return false
 			}
 			valid++

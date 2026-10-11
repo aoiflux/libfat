@@ -327,7 +327,14 @@ func (f *File) ReadDirWithOptions(opts ReadDirOptions) ([]DirEntry, error) {
 		return nil, err
 	}
 	if strict {
-		if se := f.volume.strictDirectory(data, dirCluster, f.isRoot); se != nil {
+		// ".." names the parent's first cluster, except that a parent which
+		// is the root is named 0: always on FAT12 and FAT16, where the root
+		// is no cluster, and by convention on FAT32, where it is one.
+		dotdot := f.entry.ParentFirstCluster
+		if f.volume.fatType == FATType32 && dotdot == f.volume.rootCluster {
+			dotdot = 0
+		}
+		if se := f.volume.strictDirectory(data, dirCluster, f.isRoot, dotdot); se != nil {
 			return nil, se
 		}
 	}
@@ -341,6 +348,7 @@ func (f *File) ReadDirWithOptions(opts ReadDirOptions) ([]DirEntry, error) {
 		recoverDeletedLFN:   f.volume.recoverDeletedLongNames,
 		mapOffset:           rangeOffsetMapper(ranges),
 		parentFirstCluster:  dirCluster,
+		fat32:               f.volume.fatType == FATType32,
 		includeDots:         opts.IncludeDotEntries,
 	}
 	entries := parseDirectoryEntries(data, ctx)
@@ -435,7 +443,7 @@ func (v *Volume) deletedDirectoryChildren(e DirEntry) ([]DirEntry, bool, error) 
 	if err := v.readClusterInto(buf, e.FirstCluster); err != nil {
 		return nil, false, err
 	}
-	if _, hasDots := dotEntryParent(buf, e.FirstCluster); !hasDots {
+	if _, hasDots := dotEntryParent(buf, e.FirstCluster, v.fatType == FATType32); !hasDots {
 		// A stale copy, or overwritten by a later file.
 		return nil, false, nil
 	}
@@ -457,6 +465,7 @@ func (v *Volume) deletedDirectoryChildren(e DirEntry) ([]DirEntry, bool, error) 
 		recoverDeletedLFN:   v.recoverDeletedLongNames,
 		mapOffset:           rangeOffsetMapper(ranges),
 		parentFirstCluster:  e.FirstCluster,
+		fat32:               v.fatType == FATType32,
 		recovery:            true,
 	})
 	return entries, true, nil
@@ -483,6 +492,9 @@ type dirParseContext struct {
 	recovery bool
 	// includeDots reports the "." and ".." records instead of skipping them.
 	includeDots bool
+	// fat32 says whether bytes 20-21 of a record are the high word of its first
+	// cluster; see entryFirstCluster.
+	fat32 bool
 }
 
 func (c *dirParseContext) absolute(bufOffset int) int64 {
@@ -595,9 +607,9 @@ func parseDirectoryEntries(data []byte, ctx *dirParseContext) []DirEntry {
 			continue
 		}
 
-		valid := isValidShortEntry(entry)
+		valid := isValidShortEntry(entry, ctx.fat32)
 		if valid && (deleted || ctx.recovery) {
-			valid = isPlausibleRecoveredEntry(entry)
+			valid = isPlausibleRecoveredEntry(entry, ctx.fat32)
 		}
 		if !valid {
 			resetLFN()
@@ -666,7 +678,7 @@ func parseDirectoryEntries(data []byte, ctx *dirParseContext) []DirEntry {
 			continue
 		}
 
-		firstCluster := uint32(ReadUint16LE(entry, 26)) | (uint32(ReadUint16LE(entry, 20)) << 16)
+		firstCluster := entryFirstCluster(entry, ctx.fat32)
 		clusterAllocated := false
 		if ctx.isClusterAllocated != nil {
 			if allocated, err := ctx.isClusterAllocated(firstCluster); err == nil {
@@ -926,7 +938,7 @@ func isValidLFNEntry(entry []byte, deleted bool) bool {
 	return entry[12] == 0x00 && entry[26] == 0x00 && entry[27] == 0x00
 }
 
-func isValidShortEntry(entry []byte) bool {
+func isValidShortEntry(entry []byte, fat32 bool) bool {
 	attributes := entry[11]
 	if attributes&^byte(AttrReadOnly|AttrHidden|AttrSystem|AttrVolumeID|AttrDirectory|AttrArchive) != 0 {
 		return false
@@ -935,7 +947,7 @@ func isValidShortEntry(entry []byte) bool {
 		return false
 	}
 
-	cluster := uint32(ReadUint16LE(entry, 26)) | (uint32(ReadUint16LE(entry, 20)) << 16)
+	cluster := entryFirstCluster(entry, fat32)
 	size := ReadUint32LE(entry, 28)
 	if size > 0 && cluster == 0 {
 		return false
@@ -955,14 +967,14 @@ func isValidShortEntry(entry []byte) bool {
 // recovered - a deleted record, or a cluster swept by the orphan scan - it is
 // far more often residue that happens to parse, and it carries nothing that
 // would be worth reporting even when it is genuine.
-func isPlausibleRecoveredEntry(entry []byte) bool {
-	if !isValidShortEntry(entry) {
+func isPlausibleRecoveredEntry(entry []byte, fat32 bool) bool {
+	if !isValidShortEntry(entry, fat32) {
 		return false
 	}
 	if entry[11]&AttrVolumeID != 0 {
 		return true
 	}
-	cluster := uint32(ReadUint16LE(entry, 26)) | (uint32(ReadUint16LE(entry, 20)) << 16)
+	cluster := entryFirstCluster(entry, fat32)
 	size := ReadUint32LE(entry, 28)
 	hasTimestamp := ReadUint16LE(entry, 14) != 0 || ReadUint16LE(entry, 16) != 0 || ReadUint16LE(entry, 18) != 0 || ReadUint16LE(entry, 22) != 0 || ReadUint16LE(entry, 24) != 0
 	return hasTimestamp || cluster != 0 || size != 0
@@ -1040,17 +1052,30 @@ func parseShortNameWithFirstChar(entry []byte, deleted bool, firstChar byte) str
 	return formatShortName(name, entry[12])
 }
 
+// lowerASCII lower-cases the letters A-Z in place and leaves every other byte
+// alone. That is all the NTRes case bits ask for: Windows sets them only for
+// names whose letters are ASCII, and a byte from 0x80 up is an OEM code-page
+// character whose case this package cannot know. strings.ToLower would treat
+// such a byte as invalid UTF-8 and replace it with U+FFFD.
+func lowerASCII(b []byte) {
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+}
+
 // formatShortName trims, joins and case-folds an 11-byte name field whose first
 // byte has already been resolved.
 func formatShortName(name [11]byte, ntres byte) string {
-	base := strings.TrimRight(string(name[0:8]), " ")
-	ext := strings.TrimRight(string(name[8:11]), " ")
 	if ntres&NTResLowerBase != 0 {
-		base = strings.ToLower(base)
+		lowerASCII(name[0:8])
 	}
 	if ntres&NTResLowerExt != 0 {
-		ext = strings.ToLower(ext)
+		lowerASCII(name[8:11])
 	}
+	base := strings.TrimRight(string(name[0:8]), " ")
+	ext := strings.TrimRight(string(name[8:11]), " ")
 	if ext == "" {
 		return base
 	}

@@ -16,7 +16,11 @@ import (
 // strictDirectory checks a live directory's raw records, before they are
 // parsed. dirCluster identifies the directory as DirEntry.ParentFirstCluster
 // would, and isRoot says whether "." and ".." are forbidden or required.
-func (v *Volume) strictDirectory(data []byte, dirCluster uint32, isRoot bool) *StrictError {
+// dotdot is the cluster ".." must name: the parent's first cluster, or 0 when
+// the parent is the root, which is what the specification requires and what
+// Windows and Linux write even on FAT32, where the root has a real cluster.
+func (v *Volume) strictDirectory(data []byte, dirCluster uint32, isRoot bool, dotdot uint32) *StrictError {
+	fat32 := v.fatType == FATType32
 	fail := func(check StrictCheck, offset int, format string, args ...any) *StrictError {
 		return &StrictError{
 			Check:       check,
@@ -41,9 +45,13 @@ func (v *Volume) strictDirectory(data []byte, dirCluster uint32, isRoot bool) *S
 			if !isDotRecord(rec, want) {
 				return fail(StrictDotEntries, offset, "record %d of a subdirectory is not %q", index, want)
 			}
-			if index == 0 && entryFirstCluster(rec) != dirCluster {
+			if index == 0 && entryFirstCluster(rec, fat32) != dirCluster {
 				return fail(StrictDotEntries, offset, "\".\" names cluster %d, not its own directory's %d",
-					entryFirstCluster(rec), dirCluster)
+					entryFirstCluster(rec, fat32), dirCluster)
+			}
+			if index == 1 && entryFirstCluster(rec, fat32) != dotdot {
+				return fail(StrictDotEntries, offset, "\"..\" names cluster %d, not its parent's %d (0 for the root)",
+					entryFirstCluster(rec, fat32), dotdot)
 			}
 			continue
 		}
@@ -89,7 +97,7 @@ func (v *Volume) strictDirectory(data []byte, dirCluster uint32, isRoot bool) *S
 			continue
 		}
 
-		if !isValidShortEntry(rec) {
+		if !isValidShortEntry(rec, fat32) {
 			return fail(StrictInvalidEntry, offset, "record does not parse as a short entry")
 		}
 		if lfnActive {
@@ -113,7 +121,7 @@ func (v *Volume) strictDirectory(data []byte, dirCluster uint32, isRoot bool) *S
 			return fail(StrictDotEntries, offset, "\".\" or \"..\" record outside the first two records of a subdirectory")
 		}
 
-		cluster := entryFirstCluster(rec)
+		cluster := entryFirstCluster(rec, fat32)
 		if cluster == 1 || (cluster != 0 && cluster > v.maxClusterNumber()) {
 			se := fail(StrictChainCorrupt, offset, "first cluster %d is outside the data area", cluster)
 			se.Cluster = cluster

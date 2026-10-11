@@ -49,7 +49,9 @@ type Volume struct {
 
 	cacheFAT bool
 	strict   bool
-	fatCache fatCache
+	// strictSkipFATMirror leaves the mirror comparison out of Strict.
+	strictSkipFATMirror bool
+	fatCache            fatCache
 }
 
 // fatCache holds every FAT copy in memory once loaded. tables is nil when the
@@ -104,6 +106,7 @@ func OpenWithOptions(reader io.ReaderAt, options OpenOptions) (*Volume, error) {
 		recoverDeletedLongNames:   options.RecoverDeletedLongNames,
 		cacheFAT:                  options.CacheFAT,
 		strict:                    options.Strict,
+		strictSkipFATMirror:       options.StrictSkipFATMirror,
 	}
 	if err := v.parseBootSector(); err != nil {
 		return nil, wrapVolumeError("open", err)
@@ -176,6 +179,10 @@ func (v *Volume) Close() error {
 	v.closeMu.Lock()
 	defer v.closeMu.Unlock()
 	v.closed = true
+	// The cached FAT can be hundreds of megabytes; a closed volume that is
+	// still referenced must not keep it alive. cachedFATTables refuses to load
+	// it again once closed is set.
+	v.fatCache.tables = nil
 	return nil
 }
 
@@ -656,7 +663,7 @@ func (v *Volume) readFATEntryMode(cluster uint32, strict bool) (uint32, error) {
 
 	if primary != secondary {
 		atomic.AddUint64(&v.fatMirrorMismatches, 1)
-		if strict && v.fatMirrored() {
+		if strict && !v.strictSkipFATMirror && v.fatMirrored() {
 			return 0, &StrictError{
 				Check:       StrictFATMirror,
 				EntryOffset: -1,
@@ -758,6 +765,15 @@ func (v *Volume) decodeFATEntry(buf []byte, cluster uint32) (uint32, error) {
 // without CacheFAT never loads anything.
 func (v *Volume) cachedFATTables() [][]byte {
 	if !v.cacheFAT {
+		return nil
+	}
+	// Held across the load so that Close, which takes the write lock, cannot
+	// interleave with it: either the load finishes first and Close drops what
+	// it built, or Close goes first and nothing is loaded. loadFATTables reads
+	// through v.reader directly and so does not take the lock again.
+	v.closeMu.RLock()
+	defer v.closeMu.RUnlock()
+	if v.closed {
 		return nil
 	}
 	v.fatCache.once.Do(func() {

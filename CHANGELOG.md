@@ -9,6 +9,62 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 Nothing yet.
 
+## [0.3.3] - 2026-10-11
+
+These are follow-up fixes to 0.3.2, found by checking it against the change
+request it implemented. The Go API is additive: one option is new, and nothing
+was removed or renamed.
+
+Two fixes change values that earlier versions reported. On FAT12 and FAT16, an
+entry whose bytes 20-21 are non-zero now reports a different `FirstCluster`;
+the new one is correct. Short names that carry OEM bytes and an NTRes case bit
+now keep those bytes, where they used to become U+FFFD. Reports of affected
+volumes differ from earlier ones, though the volumes have not changed.
+
+### Added
+
+- **`OpenOptions.StrictSkipFATMirror`** (FAT-R6) leaves the FAT #1 vs #2
+  comparison out of Strict and keeps every other check. Disagreements are still
+  counted by `FATMirrorMismatches`. It is off by default, so Strict is exactly
+  as strict as before.
+- **Strict checks `..`** (FAT-R5). A subdirectory's `..` must name its parent's
+  first cluster, or 0 when the parent is the root. That holds on FAT32 too:
+  there the root is a real cluster, but the specification, Windows and Linux
+  all write 0. Before, only `.` was checked. A wrong `..` is reported as
+  `StrictDotEntries`, with a detail message naming both clusters.
+
+### Fixed
+
+- **NTRes lower-casing corrupted OEM bytes** (FAT-R1). With a case bit set, the
+  base or extension went through `strings.ToLower`. That function treats each
+  byte from 0x80 up as invalid UTF-8 and replaces it with U+FFFD. So
+  `ParseShortName("\x05ABC    TXT", 0x08)` returned `"�abc.TXT"` instead
+  of `"\xe5abc.TXT"`, and `ReadDir` reported the same damaged name. Only the
+  ASCII letters A-Z are now lowered, which is what Windows does. Every other
+  byte is left as stored.
+- **FAT12 and FAT16 read the OS/2 EA index as a cluster** (FAT-R4). Bytes 20-21
+  of a short entry are the high word of the first cluster only on FAT32. On
+  FAT12 and FAT16 they hold the OS/2 extended-attribute index. A non-zero value
+  there gave the entry a first cluster far outside the volume. The file then
+  read as corrupt, and Strict reported `StrictChainCorrupt`. These bytes are
+  now decoded per FAT type everywhere a first cluster is read:
+  - directory parsing;
+  - record validation;
+  - the `.` and `..` checks;
+  - the orphan sweep;
+  - deleted-directory recovery;
+  - Strict.
+- **`Close` kept the cached FAT alive** (FAT-R3). With `CacheFAT`, up to
+  256 MiB of FAT copies stayed referenced for as long as the closed `Volume`
+  did. `Close` now drops them. The cache is loaded under the same lock `Close`
+  takes, so a lookup racing with `Close`, or arriving after it, cannot reload
+  it.
+- **`IsValid83Char`'s documentation** (FAT-R2) said bytes from 0x80 up are
+  valid only in the base. They are valid in both base and extension, and the
+  function has always accepted them in both. The documentation now says so.
+  It also notes that `ValidShortName`, judging a whole name, still rejects
+  extension bytes from 0x7F up.
+
 ## [0.3.2] - 2026-10-11
 
 The Go API is additive: no exported symbol was removed, renamed, or

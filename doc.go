@@ -393,8 +393,10 @@
 //
 //   - ReadDir and ReadDirWithOptions check the directory's records: long-name
 //     sequences and checksums; "." then ".." as the first two records of a
-//     subdirectory, with "." naming the directory itself, and neither anywhere
-//     else nor in the root; names equal under case folding, long or short;
+//     subdirectory, with "." naming the directory itself and ".." its parent -
+//     0 when the parent is the root, as the specification requires and as
+//     Windows and Linux write even on FAT32 - and neither anywhere else nor in
+//     the root; names equal under case folding, long or short;
 //     live records after the end-of-directory marker; records that do not
 //     parse; a first cluster outside the data area; and a FAT mirror
 //     disagreement on any entry's first cluster. Reading a directory's own
@@ -406,7 +408,11 @@
 //     ceil(size/cluster size). An empty file must name no cluster.
 //
 // The FAT mirror check is skipped when the volume has one FAT, or when FAT32's
-// BPB_ExtFlags says mirroring is off. A walk bounded by FragmentOptions'
+// BPB_ExtFlags says mirroring is off. A caller can also leave it out with
+// OpenOptions.StrictSkipFATMirror, for a volume whose copies are known to
+// differ but whose structure should otherwise be held to Strict; the
+// disagreements are still counted by FATMirrorMismatches. A walk bounded by
+// FragmentOptions'
 // MaxClusters or MaxRuns is not a violation: the caller chose to stop.
 //
 // Strict covers the live tree only. Deleted records, OpenEntry on a deleted or
