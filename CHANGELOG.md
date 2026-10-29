@@ -9,10 +9,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 Nothing yet.
 
-## [0.3.5] - 2026-10-29
+## [0.3.4] - 2026-10-29
 
-Two fixes and two optional callbacks; the Go API is additive. There was no
-0.3.4 release: its fixes ship here.
+Two fixes and two optional callbacks; the Go API is additive.
 
 Listings that used to fail now succeed, and entries that used to be left out
 are now listed. Every entry listed before is listed as it was. Apart from that,
