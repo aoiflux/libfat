@@ -11,10 +11,11 @@ Nothing yet.
 
 ## [0.3.4] - 2026-10-29
 
-Two fixes and two optional callbacks; the Go API is additive.
+Three fixes and two optional callbacks; the Go API is additive.
 
 Listings that used to fail now succeed, and entries that used to be left out
-are now listed. Every entry listed before is listed as it was. Apart from that,
+are now listed, including live subtrees a walk with `IncludeDeleted` used to
+lose. Every entry listed before is listed as it was. Apart from that,
 `Walk`, `WalkWithOptions`, `Report` and every existing option behave exactly
 as before: a caller that sets neither new callback sees the same entries, in
 the same order, with the same errors.
@@ -67,6 +68,17 @@ the same order, with the same errors.
   and orphan recovery use the same rule, so they can now recover such
   entries too. `IsValid83Char`'s documentation no longer describes the old
   exception. This dates from 0.1.0.
+- **A walk including deleted records could lose a live directory's whole
+  subtree.** A deleted directory claimed its first cluster in the walk's cycle
+  guard before any attempt to read it. It did so even when it was never
+  descended: `DescendDeletedDirectories` was off, or the cluster was allocated
+  again. A live directory that had since taken that cluster was then treated
+  as already walked. That is the ordinary result of removing one directory and
+  creating another: the new record lands after the stale one and gets the
+  freed cluster. A deleted directory now claims its cluster only once it is
+  descended into, so cycles of deleted records are still stopped. `ReportDeep`
+  is affected the same way. A walk without `IncludeDeleted` is unchanged. The
+  same defect was found and fixed in libxfat (XFAT-U2).
 
 ## [0.3.3] - 2026-10-11
 

@@ -77,6 +77,13 @@ type WalkOptions struct {
 	// pointing back at the cluster it was found in. That last check is the orphan
 	// scanner's stale-copy guard, and it is what separates surviving directory
 	// data from a later file that happens to start there.
+	//
+	// A deleted directory counts as walked, for the cycle guard, only once it
+	// has been descended into. Until then its first cluster is not its own to
+	// claim, and the likeliest owner is a live directory created after it was
+	// removed: the new record is written after the stale one and handed the freed
+	// cluster. That live directory is walked whether or not the deleted one came
+	// first.
 	DescendDeletedDirectories bool
 
 	// IncludeOrphans appends the entries ScanOrphans recovers, after the whole
@@ -263,7 +270,8 @@ type fatWalk struct {
 	opts WalkOptions
 	fn   func(string, uint32, DirEntry) error
 	prog *scanProgress
-	// seen holds the first cluster of every directory already descended into.
+	// seen holds the first cluster of every directory already descended into,
+	// and of every live directory whose read was attempted.
 	seen     map[uint32]struct{}
 	maxDepth int
 }
@@ -359,10 +367,15 @@ func (w *fatWalk) report(entries []DirEntry, parent uint32, depth int) error {
 			continue
 		}
 
-		// Marked before the attempt, not after it: a corrupt image can name the
-		// same unreadable cluster many times, and one failed read of it is
-		// enough.
-		w.seen[e.FirstCluster] = struct{}{}
+		// A live directory is marked before the attempt, not after it: a corrupt
+		// image can name the same unreadable cluster many times, and one failed
+		// read of it is enough. A deleted one is marked only once it is descended
+		// into, because until then the cluster may belong to a live directory
+		// created after it was removed - see DescendDeletedDirectories - whose
+		// subtree a stale claim would hide.
+		if !e.Deleted {
+			w.seen[e.FirstCluster] = struct{}{}
+		}
 
 		children, ok, err := w.children(e)
 		if err != nil {
@@ -385,6 +398,9 @@ func (w *fatWalk) report(entries []DirEntry, parent uint32, depth int) error {
 				}
 			}
 			continue
+		}
+		if e.Deleted {
+			w.seen[e.FirstCluster] = struct{}{}
 		}
 		if err := w.report(children, e.FirstCluster, depth+1); err != nil {
 			return err

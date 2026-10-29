@@ -215,6 +215,37 @@ func deletedDirImage(t *testing.T) *testImage {
 	return im
 }
 
+// TestWalkDeletedDirectoryDoesNotHideALiveReuse is the regression for a deleted
+// directory claiming its first cluster in the cycle guard before - and whether or
+// not - it was descended into. OLD was removed and NEW created after it: NEW's
+// record lands after OLD's stale one and is handed the freed cluster 20, which is
+// the ordinary result of rmdir followed by mkdir. The walk used to reach OLD
+// first, mark cluster 20 as walked without reading it - the descent was off, or
+// the FAT said the cluster was allocated again - and then take NEW for a revisit,
+// losing its whole live subtree from every walk that asked for deleted records.
+func TestWalkDeletedDirectoryDoesNotHideALiveReuse(t *testing.T) {
+	im := newTestImage(t, FATType16)
+	im.addDeletedSubdir("OLD", []uint32{20}, true)
+	im.addSubdir("NEW", []uint32{20}, makeTimestampedEntry("KEPT", "TXT", 0x20, 25, 10))
+	v := im.volume()
+	defer v.Close()
+
+	for _, opts := range []WalkOptions{
+		{},
+		{IncludeDeleted: true},
+		{IncludeDeleted: true, DescendDeletedDirectories: true},
+	} {
+		records := collectWalk(t, v, opts)
+		if !containsPath(records, "/NEW/KEPT.TXT") {
+			t.Errorf("%+v: /NEW/KEPT.TXT missing; the deleted /_LD hid the live directory reusing its cluster: %v",
+				opts, walkPaths(records))
+		}
+		if opts.IncludeDeleted && !containsPath(records, "/_LD") {
+			t.Errorf("%+v: the deleted /_LD itself was not reported: %v", opts, walkPaths(records))
+		}
+	}
+}
+
 func TestWalkDoesNotDescendDeletedDirectoryByDefault(t *testing.T) {
 	im := deletedDirImage(t)
 	v := im.volume()
