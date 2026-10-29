@@ -246,6 +246,44 @@ func TestWalkDeletedDirectoryDoesNotHideALiveReuse(t *testing.T) {
 	}
 }
 
+// TestWalkDeletedDirectoryAfterLiveReuseIsRevisit is the other slot order: NEW
+// was created in an earlier freed slot, so its record precedes OLD's stale one.
+// NEW is walked first and claims cluster 20, and OLD is then reported as
+// SkipRevisit - whether or not DescendDeletedDirectories is set, since the
+// revisit test comes first. That is an ordinary volume, not a cycle, which is
+// what SkipRevisit's documentation says.
+func TestWalkDeletedDirectoryAfterLiveReuseIsRevisit(t *testing.T) {
+	im := newTestImage(t, FATType16)
+	// OLD's data and freed chain first, then NEW over the same cluster.
+	im.addDeletedSubdir("OLD", []uint32{20}, false)
+	im.addSubdir("NEW", []uint32{20}, makeTimestampedEntry("KEPT", "TXT", 0x20, 25, 10))
+	old := makeShortEntry("OLD", "", 0x10, 20, 0)
+	putUint16LE(old, 24, 0x4A21)
+	old[0] = DeletedMarker
+	im.addRootRaw(old)
+	v := im.volume()
+	defer v.Close()
+
+	for _, descend := range []bool{false, true} {
+		var skipped []string
+		opts := WalkOptions{
+			IncludeDeleted:            true,
+			DescendDeletedDirectories: descend,
+			OnSkip: func(path string, e DirEntry, reason SkipReason, err error) error {
+				skipped = append(skipped, path+"="+string(reason))
+				return nil
+			},
+		}
+		records := collectWalk(t, v, opts)
+		if !containsPath(records, "/NEW/KEPT.TXT") || !containsPath(records, "/_LD") {
+			t.Fatalf("descend=%v: walk = %v", descend, walkPaths(records))
+		}
+		if len(skipped) != 1 || skipped[0] != "/_LD="+string(SkipRevisit) {
+			t.Fatalf("descend=%v: OnSkip saw %v, want only /_LD as %s", descend, skipped, SkipRevisit)
+		}
+	}
+}
+
 func TestWalkDoesNotDescendDeletedDirectoryByDefault(t *testing.T) {
 	im := deletedDirImage(t)
 	v := im.volume()

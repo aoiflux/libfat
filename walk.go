@@ -26,9 +26,13 @@ const (
 	// SkipDepthLimit: the directory sits on WalkOptions.MaxDepth, so it is
 	// reported but not read.
 	SkipDepthLimit SkipReason = "depth-limit"
-	// SkipRevisit: the directory's first cluster had already been descended
-	// into. A valid FAT volume cannot produce this; it is a cycle or a
-	// cross-link, and the record naming it is still reported as evidence.
+	// SkipRevisit: the directory's first cluster had already been walked - a
+	// live directory counts once its read was attempted, a deleted one once it
+	// was descended into. For a live directory a valid FAT volume cannot
+	// produce this: it is a cycle or a cross-link, and the record naming it is
+	// still reported as evidence. For a deleted directory it is ordinary: the
+	// cluster was freed by the deletion and handed to a live directory whose
+	// record came earlier and was walked first.
 	SkipRevisit SkipReason = "revisit"
 	// SkipInvalidCluster: the first cluster is not a data-area cluster, so
 	// there is nothing to read and no read to fail.
@@ -142,15 +146,17 @@ type WalkOptions struct {
 	// and at most once for each. The conditions are tested in the order
 	// SkipDepthLimit, SkipInvalidCluster, SkipRevisit, SkipReadError,
 	// SkipDeletedUnrecoverable, and the first that holds is the one reported.
-	// A directory named twice whose first read failed is reported SkipReadError
-	// and then SkipRevisit, because the cycle guard is marked before the
-	// attempt.
+	// A live directory named twice whose first read failed is reported
+	// SkipReadError and then SkipRevisit, because a live directory's cycle
+	// guard is marked before the attempt.
 	//
 	// Nothing is reported for a file, for a virtual entry - which names no
 	// directory data - for a deleted record IncludeDeleted left out, or for a
 	// deleted directory not descended because DescendDeletedDirectories is off:
 	// that last is the caller's own choice rather than something the walk
-	// decided. With StopOnReadError set, an unreadable directory aborts the walk
+	// decided. An earlier condition still wins, so such a deleted directory is
+	// reported when it sits on MaxDepth, names no data-area cluster, or names a
+	// cluster already walked. With StopOnReadError set, an unreadable directory aborts the walk
 	// and OnSkip is not called, because nothing was skipped.
 	//
 	// An error returned by OnSkip stops the walk immediately and is returned

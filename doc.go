@@ -193,7 +193,9 @@
 //
 // Five kinds of directory are reported without being descended into: one that
 // cannot be read, one sitting on MaxDepth, one whose first cluster has already
-// been walked - a cycle or a cross-link - one whose first cluster is not a
+// been walked - a cycle or a cross-link, or, for a deleted directory, the
+// ordinary case of a live directory that took over its cluster and came
+// first - one whose first cluster is not a
 // data-area cluster at all, and a deleted one whose surviving data the
 // stale-copy guard refused. Set OnSkip to hear about each, with its SkipReason
 // and, for a failed read, the error:
