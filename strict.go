@@ -19,7 +19,9 @@ import (
 // dotdot is the cluster ".." must name: the parent's first cluster, or 0 when
 // the parent is the root, which is what the specification requires and what
 // Windows and Linux write even on FAT32, where the root has a real cluster.
-func (v *Volume) strictDirectory(data []byte, dirCluster uint32, isRoot bool, dotdot uint32) *StrictError {
+// knownParent is false when the parent is not known, and ".." is then not
+// checked.
+func (v *Volume) strictDirectory(data []byte, dirCluster uint32, isRoot bool, dotdot uint32, knownParent bool) *StrictError {
 	fat32 := v.fatType == FATType32
 	fail := func(check StrictCheck, offset int, format string, args ...any) *StrictError {
 		return &StrictError{
@@ -49,7 +51,7 @@ func (v *Volume) strictDirectory(data []byte, dirCluster uint32, isRoot bool, do
 				return fail(StrictDotEntries, offset, "\".\" names cluster %d, not its own directory's %d",
 					entryFirstCluster(rec, fat32), dirCluster)
 			}
-			if index == 1 && entryFirstCluster(rec, fat32) != dotdot {
+			if index == 1 && knownParent && entryFirstCluster(rec, fat32) != dotdot {
 				return fail(StrictDotEntries, offset, "\"..\" names cluster %d, not its parent's %d (0 for the root)",
 					entryFirstCluster(rec, fat32), dotdot)
 			}

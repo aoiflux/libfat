@@ -330,11 +330,14 @@ func (f *File) ReadDirWithOptions(opts ReadDirOptions) ([]DirEntry, error) {
 		// ".." names the parent's first cluster, except that a parent which
 		// is the root is named 0: always on FAT12 and FAT16, where the root
 		// is no cluster, and by convention on FAT32, where it is one.
-		dotdot := f.entry.ParentFirstCluster
+		// A directory opened through one of its own "." or ".." records was
+		// reached without its parent, so there is nothing to hold its ".."
+		// to; every other check still applies.
+		dotdot, knownParent := f.entry.ParentFirstCluster, f.entry.Name != "." && f.entry.Name != ".."
 		if f.volume.fatType == FATType32 && dotdot == f.volume.rootCluster {
 			dotdot = 0
 		}
-		if se := f.volume.strictDirectory(data, dirCluster, f.isRoot, dotdot); se != nil {
+		if se := f.volume.strictDirectory(data, dirCluster, f.isRoot, dotdot, knownParent); se != nil {
 			return nil, se
 		}
 	}
@@ -1000,7 +1003,7 @@ func looksLikeShortName(base, ext []byte) bool {
 			seenSpace = true
 			continue
 		}
-		if seenSpace || !isValid83Char(value, false) || value >= 0x7F {
+		if seenSpace || !isValid83Char(value, false) {
 			return false
 		}
 	}

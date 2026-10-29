@@ -317,12 +317,48 @@ func FuzzWalk(f *testing.F) {
 		defer v.Close()
 
 		calls := 0
+		skips := 0
 		walkErr := v.WalkWithOptions(context.Background(), WalkOptions{
 			IncludeDeleted:            includeDeleted,
 			DescendDeletedDirectories: descendDeleted,
 			IncludeOrphans:            includeOrphans,
 			OrphanScan:                OrphanScanOptions{MaxClusters: 4096, MaxDirectories: 32},
 			MaxDepth:                  int(maxDepth),
+			OnSkip: func(path string, e DirEntry, reason SkipReason, err error) error {
+				skips++
+				if skips > 4096 {
+					return errBudget
+				}
+				switch reason {
+				case SkipReadError:
+					if err == nil {
+						t.Fatalf("%s: %s reported without an error", path, reason)
+					}
+				case SkipDepthLimit, SkipRevisit, SkipInvalidCluster, SkipDeletedUnrecoverable:
+					if err != nil {
+						t.Fatalf("%s: %s reported with an error %v; no read was attempted",
+							path, reason, err)
+					}
+				default:
+					t.Fatalf("%s: unknown skip reason %q", path, reason)
+				}
+				if path == "" || path[0] != '/' {
+					t.Fatalf("skipped path %q is not rooted", path)
+				}
+				if path != e.Path {
+					t.Fatalf("skipped path %q != entry.Path %q", path, e.Path)
+				}
+				if !e.IsDirectory {
+					t.Fatalf("%s was reported skipped but is not a directory", path)
+				}
+				return nil
+			},
+			OnOrphanScan: func(result *OrphanScanResult) error {
+				if result == nil {
+					t.Fatal("OnOrphanScan was called with no result")
+				}
+				return nil
+			},
 		}, func(path string, parent uint32, e DirEntry) error {
 			calls++
 			if calls > 4096 {

@@ -209,3 +209,90 @@ func TestStrictDotDotNamesParent(t *testing.T) {
 		})
 	}
 }
+
+// TestStrictReadsDirectoryOpenedThroughDotEntries: a directory opened through
+// one of its own "." or ".." records was reached without its parent, so Strict
+// cannot hold its ".." to anything, and must list it rather than refuse it.
+// Its "." is still checked.
+func TestStrictReadsDirectoryOpenedThroughDotEntries(t *testing.T) {
+	for _, fatType := range []string{FATType16, FATType32} {
+		t.Run(fatType, func(t *testing.T) {
+			im := newTestImage(t, fatType)
+			im.writeSubdir([]uint32{60}, 50, makeTimestampedEntry("DEEP", "TXT", AttrArchive, 0, 0))
+			im.addSubdir("SUB", []uint32{50}, makeTimestampedEntry("INNER", "", AttrDirectory, 60, 0))
+			v := strictVolume(t, im)
+			inner, err := v.OpenPath("/SUB/INNER")
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries, err := inner.ReadDirWithOptions(ReadDirOptions{IncludeDotEntries: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]string{".": "DEEP.TXT", "..": "INNER"}
+			for _, e := range entries {
+				name, ok := want[e.Name]
+				if !ok {
+					continue
+				}
+				delete(want, e.Name)
+				f, err := v.OpenEntry(e)
+				if err != nil {
+					t.Fatal(err)
+				}
+				listed, err := f.ReadDir()
+				if err != nil {
+					t.Fatalf("%s: %v", e.Name, err)
+				}
+				if len(listed) != 1 || listed[0].Name != name {
+					t.Errorf("%s lists %+v, want %s", e.Name, listed, name)
+				}
+			}
+			if len(want) != 0 {
+				t.Fatalf("no %v among %+v", want, entries)
+			}
+
+			// "." pointing elsewhere is still caught through a "." record.
+			putUint16LE(im.data, int(im.clusterOffset(60))+26, 61)
+			v = strictVolume(t, im)
+			sub, err := v.OpenPath("/SUB")
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries, err = sub.ReadDirWithOptions(ReadDirOptions{IncludeDotEntries: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range entries {
+				if e.Name == "INNER" {
+					f, err := v.OpenEntry(e)
+					if err != nil {
+						t.Fatal(err)
+					}
+					_, err = f.ReadDir()
+					requireStrict(t, err, StrictDotEntries, 60, 0)
+				}
+			}
+		})
+	}
+}
+
+// TestShortNameExtensionTakesOEMBytes: bytes from 0x7F up are as valid in the
+// extension as in the base. A live record whose extension carries one is
+// listed, under that byte, and ValidShortName accepts its name.
+func TestShortNameExtensionTakesOEMBytes(t *testing.T) {
+	for _, raw := range []string{"ABC     \x7fXT", "ABC     T\x80T", "ABC     TX\xff", "ABC     \x99  "} {
+		name := raw11(raw)
+		if !ValidShortName(name) {
+			t.Errorf("ValidShortName(%q) = false", raw)
+		}
+		im := newTestImage(t, FATType16)
+		rec := makeTimestampedEntry("", "", AttrArchive, 0, 0)
+		copy(rec[0:11], raw)
+		im.addRootRaw(rec)
+		entries := mustReadRoot(t, im.volume())
+		if want := ParseShortName(name, 0); len(entries) != 1 || entries[0].ShortName != want {
+			t.Errorf("%q: listing %+v, want %q", raw, entries, want)
+		}
+	}
+}

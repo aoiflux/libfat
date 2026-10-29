@@ -9,6 +9,66 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 Nothing yet.
 
+## [0.3.5] - 2026-10-29
+
+Two fixes and two optional callbacks; the Go API is additive. There was no
+0.3.4 release: its fixes ship here.
+
+Listings that used to fail now succeed, and entries that used to be left out
+are now listed. Every entry listed before is listed as it was. Apart from that,
+`Walk`, `WalkWithOptions`, `Report` and every existing option behave exactly
+as before: a caller that sets neither new callback sees the same entries, in
+the same order, with the same errors.
+
+### Added
+
+- **`WalkOptions.OnSkip`** (FAT-U1) is called for every directory a walk
+  reported but did not descend into, with a `SkipReason` and, for a failed
+  read, the underlying error. Five reasons: `SkipReadError`,
+  `SkipDepthLimit`, `SkipRevisit` (a cycle or cross-link, whose first cluster
+  had already been walked), `SkipInvalidCluster` (a first cluster outside the
+  data area, which is never read and so never fails) and
+  `SkipDeletedUnrecoverable` (`DescendDeletedDirectories` was set, but the
+  cluster has been reallocated or no longer begins with `.` and `..`). Until
+  now the only signal was the absence of children, which is what an empty
+  directory looks like too, so three kinds of subtree were lost in silence. It
+  is called only for an entry the walk callback was already handed, and at most
+  once for each; nothing is reported for a file, a virtual entry, a record
+  `IncludeDeleted` left out, or a deleted directory left alone because
+  `DescendDeletedDirectories` is off. An error it returns stops the walk and is
+  returned unchanged. With `StopOnReadError` set, an unreadable directory
+  aborts the walk as before and `OnSkip` is not called. Under `Strict` a
+  directory that fails a check arrives as `SkipReadError` carrying the
+  `*StrictError`, so a strict walk can report which directory failed which
+  check without aborting.
+- **`WalkOptions.OnOrphanScan`** is called once with the `*OrphanScanResult`
+  that `IncludeOrphans` produced, before any orphan entry is reported. The walk
+  used to report the scan's entries and discard the result, losing
+  `Truncated` - a bound stopped the sweep early - and `ReachableWalkFailed` -
+  part of the live tree could not be walked, so some reported orphans may in
+  fact be reachable. An error it returns stops the walk and no orphan entry is
+  reported.
+
+### Fixed
+
+- **Strict refused a directory opened through a `.` or `..` record.** Opening
+  such a record with `OpenEntry` (it comes from `ReadDirOptions.IncludeDotEntries`)
+  and calling `ReadDir` held the directory's `..` to the cluster of the
+  directory the record was listed in. That is the directory itself for `.`
+  and a child for `..`, never the parent. The listing failed with a false
+  `StrictDotEntries`. A directory reached this way has no known parent, so
+  Strict no longer checks its `..`. Its `.` is still checked, as is every
+  other record.
+- **A live entry with a byte from 0x7F up in its extension was dropped.**
+  The extension was held to a stricter rule than the base: bytes from 0x7F up
+  were rejected there, while the base takes them as OEM code-page
+  characters, as Windows and the specification do. `ReadDir` left such an
+  entry out of the listing, Strict refused it as `StrictInvalidEntry`, and
+  `ValidShortName` rejected its name. All three now accept it. Deleted-entry
+  and orphan recovery use the same rule, so they can now recover such
+  entries too. `IsValid83Char`'s documentation no longer describes the old
+  exception. This dates from 0.1.0.
+
 ## [0.3.3] - 2026-10-11
 
 These are follow-up fixes to 0.3.2, found by checking it against the change

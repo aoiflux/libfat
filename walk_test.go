@@ -558,3 +558,431 @@ func TestWalkAcrossFATTypes(t *testing.T) {
 		})
 	}
 }
+
+// skipRecord is one OnSkip invocation.
+type skipRecord struct {
+	path   string
+	entry  DirEntry
+	reason SkipReason
+	err    error
+}
+
+// collectWalkAndSkips runs a walk whose OnSkip records every call.
+func collectWalkAndSkips(t *testing.T, v *Volume, opts WalkOptions) ([]walkRecord, []skipRecord) {
+	t.Helper()
+	var got []walkRecord
+	var skips []skipRecord
+	opts.OnSkip = func(p string, e DirEntry, reason SkipReason, err error) error {
+		skips = append(skips, skipRecord{path: p, entry: e, reason: reason, err: err})
+		return nil
+	}
+	err := v.WalkWithOptions(context.Background(), opts, func(p string, parent uint32, e DirEntry) error {
+		got = append(got, walkRecord{path: p, parent: parent, entry: e})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WalkWithOptions failed: %v", err)
+	}
+	return got, skips
+}
+
+func skipPaths(skips []skipRecord) []string {
+	paths := make([]string, 0, len(skips))
+	for _, s := range skips {
+		paths = append(paths, string(s.reason)+" "+s.path)
+	}
+	return paths
+}
+
+func skipFor(t *testing.T, skips []skipRecord, want string) skipRecord {
+	t.Helper()
+	for _, s := range skips {
+		if s.path == want {
+			return s
+		}
+	}
+	t.Fatalf("no skip reported for %q; skips were %v", want, skipPaths(skips))
+	return skipRecord{}
+}
+
+// skipImage holds one directory for each live reason a walk declines to
+// descend, plus an empty directory that must never be reported as skipped and a
+// file after them all so that continuation stays observable.
+//
+//	/EMPTY             cluster 15, no children at all
+//	/BADDIR            cluster 10, chain runs into a bad cluster
+//	/FARDIR            first cluster 60000, past the end of the data area
+//	/OUTER             cluster 20, holds INNER
+//	/OUTER/INNER       cluster 22, holds LOOP
+//	/OUTER/INNER/LOOP  names cluster 20 again, its own grandparent
+//	/AFTER.TXT
+func skipImage(t *testing.T) *testImage {
+	t.Helper()
+	im := newTestImage(t, FATType16)
+
+	im.addSubdir("EMPTY", []uint32{15})
+
+	im.addSubdir("BADDIR", []uint32{10}, makeTimestampedEntry("CHILD", "TXT", 0x20, 30, 8))
+	im.setFATEntry(10, im.badCluster())
+
+	// 60000 is above maxClusterNumber on this image (9888) and below the FAT16
+	// end-of-chain and bad-cluster values, so the record parses and is listed.
+	im.addRootRaw(makeTimestampedEntry("FARDIR", "", 0x10, 60000, 0))
+
+	im.writeSubdir([]uint32{22}, 20, makeTimestampedEntry("LOOP", "", 0x10, 20, 0))
+	im.addSubdir("OUTER", []uint32{20}, makeTimestampedEntry("INNER", "", 0x10, 22, 0))
+
+	im.addFile(testFile{base: "AFTER", ext: "TXT", clusters: []uint32{5}, size: 4, terminate: true})
+	return im
+}
+
+// TestWalkOnSkipReportsEveryUndescendedDirectory is the headline test: each of
+// the three live skips is reported once, with its own reason, and the empty
+// directory - which is what all three look like without the callback - is not
+// reported at all.
+func TestWalkOnSkipReportsEveryUndescendedDirectory(t *testing.T) {
+	im := skipImage(t)
+	v := im.volume()
+	defer v.Close()
+
+	records, skips := collectWalkAndSkips(t, v, WalkOptions{})
+
+	if len(skips) != 3 {
+		t.Fatalf("got %d skips %v, want exactly 3", len(skips), skipPaths(skips))
+	}
+
+	bad := skipFor(t, skips, "/BADDIR")
+	if bad.reason != SkipReadError {
+		t.Fatalf("/BADDIR reason = %q, want %q", bad.reason, SkipReadError)
+	}
+	if bad.err == nil {
+		t.Fatal("/BADDIR was reported without the underlying read error")
+	}
+
+	far := skipFor(t, skips, "/FARDIR")
+	if far.reason != SkipInvalidCluster {
+		t.Fatalf("/FARDIR reason = %q, want %q", far.reason, SkipInvalidCluster)
+	}
+	if far.err != nil {
+		t.Fatalf("/FARDIR carried an error %v; no read was attempted", far.err)
+	}
+
+	loop := skipFor(t, skips, "/OUTER/INNER/LOOP")
+	if loop.reason != SkipRevisit {
+		t.Fatalf("the cross-link reason = %q, want %q", loop.reason, SkipRevisit)
+	}
+	if loop.err != nil {
+		t.Fatalf("the cross-link carried an error %v; no read was attempted", loop.err)
+	}
+
+	for _, s := range skips {
+		if s.path != s.entry.Path {
+			t.Fatalf("skip path %q != entry.Path %q", s.path, s.entry.Path)
+		}
+		if !s.entry.IsDirectory {
+			t.Fatalf("%s was reported skipped but is not a directory", s.path)
+		}
+		if s.path == "/EMPTY" {
+			t.Fatal("an empty directory was reported as skipped")
+		}
+	}
+
+	// Every skipped directory was handed to the walk callback first, and the
+	// walk carried on to the end.
+	for _, want := range []string{"/EMPTY", "/BADDIR", "/FARDIR", "/OUTER/INNER/LOOP", "/AFTER.TXT"} {
+		if !containsPath(records, want) {
+			t.Fatalf("%s missing from the walk; walked %v", want, walkPaths(records))
+		}
+	}
+}
+
+func TestWalkOnSkipReportsDepthLimit(t *testing.T) {
+	im := skipImage(t)
+	v := im.volume()
+	defer v.Close()
+
+	_, atTwo := collectWalkAndSkips(t, v, WalkOptions{MaxDepth: 2})
+	inner := skipFor(t, atTwo, "/OUTER/INNER")
+	if inner.reason != SkipDepthLimit {
+		t.Fatalf("/OUTER/INNER reason = %q, want %q", inner.reason, SkipDepthLimit)
+	}
+	if inner.err != nil {
+		t.Fatalf("/OUTER/INNER carried an error %v; the depth cap is not a failure", inner.err)
+	}
+
+	// The depth check precedes the cluster and revisit checks, so a directory on
+	// the limit reports the cap whatever else is wrong with it.
+	_, atOne := collectWalkAndSkips(t, v, WalkOptions{MaxDepth: 1})
+	outer := skipFor(t, atOne, "/OUTER")
+	if outer.reason != SkipDepthLimit {
+		t.Fatalf("/OUTER reason = %q, want %q", outer.reason, SkipDepthLimit)
+	}
+	far := skipFor(t, atOne, "/FARDIR")
+	if far.reason != SkipDepthLimit {
+		t.Fatalf("/FARDIR at the depth limit reason = %q, want %q", far.reason, SkipDepthLimit)
+	}
+}
+
+// TestWalkOnSkipReportsDeletedDirectoryRefusedByGuard covers the one skip that
+// is the stale-copy guard's own refusal rather than a limit or a failed read.
+func TestWalkOnSkipReportsDeletedDirectoryRefusedByGuard(t *testing.T) {
+	t.Run("reallocated first cluster", func(t *testing.T) {
+		im := deletedDirImage(t)
+		im.linkChain([]uint32{20}, true)
+		v := im.volume()
+		defer v.Close()
+
+		_, skips := collectWalkAndSkips(t, v,
+			WalkOptions{IncludeDeleted: true, DescendDeletedDirectories: true})
+		if len(skips) != 1 {
+			t.Fatalf("got %d skips %v, want exactly 1", len(skips), skipPaths(skips))
+		}
+		if s := skipFor(t, skips, deletedDirPath); s.reason != SkipDeletedUnrecoverable {
+			t.Fatalf("reason = %q, want %q", s.reason, SkipDeletedUnrecoverable)
+		}
+	})
+
+	t.Run("dot records overwritten", func(t *testing.T) {
+		im := deletedDirImage(t)
+		im.writeRawCluster(20, patternBytes(64, 0x11))
+		v := im.volume()
+		defer v.Close()
+
+		_, skips := collectWalkAndSkips(t, v,
+			WalkOptions{IncludeDeleted: true, DescendDeletedDirectories: true})
+		if s := skipFor(t, skips, deletedDirPath); s.reason != SkipDeletedUnrecoverable {
+			t.Fatalf("reason = %q, want %q", s.reason, SkipDeletedUnrecoverable)
+		}
+	})
+
+	// Not descending because the option is off is the caller's own choice, not
+	// something the walk decided, so it is not reported.
+	t.Run("descent not requested", func(t *testing.T) {
+		im := deletedDirImage(t)
+		v := im.volume()
+		defer v.Close()
+
+		_, skips := collectWalkAndSkips(t, v, WalkOptions{IncludeDeleted: true})
+		if len(skips) != 0 {
+			t.Fatalf("got %v, want no skips when DescendDeletedDirectories is off", skipPaths(skips))
+		}
+	})
+}
+
+// TestWalkOnSkipIsSilentForEntriesTheWalkDidNotReport pins the invariant that
+// OnSkip only ever names a record the walk callback was handed.
+func TestWalkOnSkipIsSilentForEntriesTheWalkDidNotReport(t *testing.T) {
+	t.Run("deleted directory left out", func(t *testing.T) {
+		im := deletedDirImage(t)
+		v := im.volume()
+		defer v.Close()
+
+		_, skips := collectWalkAndSkips(t, v, WalkOptions{})
+		if len(skips) != 0 {
+			t.Fatalf("got %v, want no skips for a record IncludeDeleted excluded", skipPaths(skips))
+		}
+	})
+
+	t.Run("virtual entries and files", func(t *testing.T) {
+		im := newTestImage(t, FATType16)
+		im.addFile(testFile{base: "REAL", ext: "TXT", clusters: []uint32{5}, size: 4, terminate: true})
+		v := im.volumeWithOptions(OpenOptions{IncludeVirtualRootEntries: true})
+		defer v.Close()
+
+		records, skips := collectWalkAndSkips(t, v, WalkOptions{})
+		if !containsPath(records, OrphanPath) {
+			t.Fatalf("the virtual %s entry was not reported; walked %v", OrphanPath, walkPaths(records))
+		}
+		if len(skips) != 0 {
+			t.Fatalf("got %v, want no skips: a virtual entry names no directory data", skipPaths(skips))
+		}
+	})
+}
+
+func TestWalkOnSkipErrorStopsTheWalk(t *testing.T) {
+	im := unreadableDirImage(t)
+	v := im.volume()
+	defer v.Close()
+
+	sentinel := errors.New("stop at the first skip")
+	calls := 0
+	var got []string
+	err := v.WalkWithOptions(context.Background(), WalkOptions{
+		OnSkip: func(string, DirEntry, SkipReason, error) error {
+			calls++
+			return sentinel
+		},
+	}, func(p string, _ uint32, _ DirEntry) error {
+		got = append(got, p)
+		return nil
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("WalkWithOptions returned %v, want the callback's own error", err)
+	}
+	if calls != 1 {
+		t.Fatalf("OnSkip ran %d times, want 1", calls)
+	}
+	for _, p := range got {
+		if p == "/AFTER.TXT" {
+			t.Fatalf("the walk continued past the OnSkip error; walked %v", got)
+		}
+	}
+}
+
+// TestWalkStopOnReadErrorDoesNotCallOnSkip pins the documented interaction: the
+// walk aborts, so nothing was skipped.
+func TestWalkStopOnReadErrorDoesNotCallOnSkip(t *testing.T) {
+	im := unreadableDirImage(t)
+	v := im.volume()
+	defer v.Close()
+
+	calls := 0
+	err := v.WalkWithOptions(context.Background(), WalkOptions{
+		StopOnReadError: true,
+		OnSkip: func(string, DirEntry, SkipReason, error) error {
+			calls++
+			return nil
+		},
+	}, func(string, uint32, DirEntry) error { return nil })
+	if err == nil {
+		t.Fatal("StopOnReadError did not surface the underlying error")
+	}
+	if calls != 0 {
+		t.Fatalf("OnSkip ran %d times; an aborted walk skipped nothing", calls)
+	}
+}
+
+// TestWalkWithoutOnSkipIsUnchanged is both the additivity pin and the statement
+// of the defect: with no callback the empty directory and the three undescended
+// ones are indistinguishable, and the walk still returns nil.
+func TestWalkWithoutOnSkipIsUnchanged(t *testing.T) {
+	im := skipImage(t)
+	v := im.volume()
+	defer v.Close()
+
+	got := walkPaths(collectWalk(t, v, WalkOptions{}))
+	want := []string{"/EMPTY", "/BADDIR", "/FARDIR", "/OUTER", "/OUTER/INNER", "/OUTER/INNER/LOOP", "/AFTER.TXT"}
+	if len(got) != len(want) {
+		t.Fatalf("walked %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("walked %v, want %v", got, want)
+		}
+	}
+}
+
+// TestWalkOnOrphanScanReportsScanProvenance covers the second signal the walk
+// used to throw away: the scan's own account of what it could not cover.
+func TestWalkOnOrphanScanReportsScanProvenance(t *testing.T) {
+	orphanImage := func(t *testing.T) *testImage {
+		t.Helper()
+		im := newTestImage(t, FATType16)
+		im.addFile(testFile{base: "LIVE", ext: "TXT", clusters: []uint32{5}, size: 4, terminate: true})
+		im.addDeletedSubdir("GONE", []uint32{30, 31}, false,
+			makeTimestampedEntry("LOST", "TXT", 0x20, 40, 16))
+		return im
+	}
+
+	t.Run("unbounded scan", func(t *testing.T) {
+		v := orphanImage(t).volume()
+		defer v.Close()
+
+		calls := 0
+		var seen *OrphanScanResult
+		err := v.WalkWithOptions(context.Background(), WalkOptions{
+			IncludeOrphans: true,
+			OnOrphanScan: func(r *OrphanScanResult) error {
+				calls++
+				seen = r
+				return nil
+			},
+		}, func(string, uint32, DirEntry) error { return nil })
+		if err != nil {
+			t.Fatalf("WalkWithOptions failed: %v", err)
+		}
+		if calls != 1 {
+			t.Fatalf("OnOrphanScan ran %d times, want exactly 1", calls)
+		}
+		if seen.Truncated {
+			t.Fatal("an unbounded scan reported itself truncated")
+		}
+		if seen.ReachableWalkFailed {
+			t.Fatal("a readable tree reported ReachableWalkFailed")
+		}
+		if len(seen.Directories) == 0 {
+			t.Fatal("the scan result carried no orphan directories")
+		}
+	})
+
+	t.Run("bounded scan", func(t *testing.T) {
+		v := orphanImage(t).volume()
+		defer v.Close()
+
+		var seen *OrphanScanResult
+		err := v.WalkWithOptions(context.Background(), WalkOptions{
+			IncludeOrphans: true,
+			OrphanScan:     OrphanScanOptions{MaxClusters: 1},
+			OnOrphanScan: func(r *OrphanScanResult) error {
+				seen = r
+				return nil
+			},
+		}, func(string, uint32, DirEntry) error { return nil })
+		if err != nil {
+			t.Fatalf("WalkWithOptions failed: %v", err)
+		}
+		if seen == nil || !seen.Truncated {
+			t.Fatalf("a scan bounded to one cluster did not report Truncated: %+v", seen)
+		}
+	})
+
+	t.Run("blind reachability pre-pass", func(t *testing.T) {
+		im := orphanImage(t)
+		im.addSubdir("SUB", []uint32{10}, makeTimestampedEntry("CHILD", "TXT", 0x20, 20, 8))
+		im.setFATEntry(10, im.badCluster())
+
+		v := im.volume()
+		defer v.Close()
+
+		var seen *OrphanScanResult
+		err := v.WalkWithOptions(context.Background(), WalkOptions{
+			IncludeOrphans: true,
+			OnOrphanScan: func(r *OrphanScanResult) error {
+				seen = r
+				return nil
+			},
+		}, func(string, uint32, DirEntry) error { return nil })
+		if err != nil {
+			t.Fatalf("WalkWithOptions failed: %v", err)
+		}
+		if seen == nil || !seen.ReachableWalkFailed {
+			t.Fatalf("an unreadable live subtree did not set ReachableWalkFailed: %+v", seen)
+		}
+	})
+
+	t.Run("hook error stops the walk", func(t *testing.T) {
+		v := orphanImage(t).volume()
+		defer v.Close()
+
+		sentinel := errors.New("refuse a blind scan")
+		var got []string
+		err := v.WalkWithOptions(context.Background(), WalkOptions{
+			IncludeOrphans: true,
+			OnOrphanScan:   func(*OrphanScanResult) error { return sentinel },
+		}, func(p string, _ uint32, _ DirEntry) error {
+			got = append(got, p)
+			return nil
+		})
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("WalkWithOptions returned %v, want the hook's own error", err)
+		}
+		for _, p := range got {
+			if len(p) >= len(OrphanPath) && p[:len(OrphanPath)] == OrphanPath {
+				t.Fatalf("an orphan entry was reported after the hook refused the scan; walked %v", got)
+			}
+		}
+		if len(got) == 0 {
+			t.Fatal("the reachable tree should have been reported before the scan ran")
+		}
+	})
+}

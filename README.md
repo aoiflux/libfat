@@ -25,7 +25,8 @@ Implemented now:
   reported offset can be compared against externally supplied byte ranges with
   no adjustment by the caller
 - Recursive traversal via `Volume.Walk`, with deleted records and orphan runs
-  opt-in
+  opt-in, and `WalkOptions.OnSkip` reporting every directory it could not
+  descend into
 - Fragment-aware streaming reads (`Reader`, `ReaderAt`, `SectionReader`) that do
   not buffer the whole file
 - Absolute directory-entry offsets (`EntryAbsoluteOffset`), correct even for
@@ -151,6 +152,21 @@ err := v.WalkWithOptions(ctx, libfat.WalkOptions{
     IncludeDeleted:            true,
     DescendDeletedDirectories: true,
     IncludeOrphans:            true,
+}, fn)
+```
+
+A directory the walk reports but cannot descend into - unreadable, at
+`MaxDepth`, already walked, outside the data area, or a deleted one whose data
+no longer survives - otherwise looks exactly like an empty one. Set `OnSkip` to
+hear about each, and `OnOrphanScan` to see whether the orphan sweep was cut
+short:
+
+```go
+err := v.WalkWithOptions(ctx, libfat.WalkOptions{
+    OnSkip: func(path string, e libfat.DirEntry, reason libfat.SkipReason, err error) error {
+        fmt.Println("skipped", path, reason, err)
+        return nil
+    },
 }, fn)
 ```
 
@@ -311,6 +327,13 @@ Walking the tree:
 - `(*Volume).WalkWithOptions(ctx, opts WalkOptions, fn) error` — deleted records
   and unreachable directory data are opt-in, so one pass serves both change
   detection and recovery
+- `WalkOptions.OnSkip` — called for each directory reported but not descended
+  into, with a `SkipReason` (`SkipReadError`, `SkipDepthLimit`, `SkipRevisit`,
+  `SkipInvalidCluster`, `SkipDeletedUnrecoverable`) and, for a failed read, the
+  error; under `Strict` a failed check arrives as `SkipReadError` carrying the
+  `*StrictError`
+- `WalkOptions.OnOrphanScan` — receives the `*OrphanScanResult` behind
+  `IncludeOrphans`, so `Truncated` and `ReachableWalkFailed` are not lost
 - `(*Volume).FileID(entry DirEntry) (FileID, bool)` — the composite
   `{ParentFirstCluster, EntrySlotIndex}` identity, and `FixedRootCluster` for
   the FAT12/16 root region

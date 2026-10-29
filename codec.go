@@ -91,9 +91,7 @@ func LFNChecksum(short [11]byte) byte {
 // "." and ".." records.
 //
 // It judges one byte. Whether a whole name is accepted is ValidShortName's
-// question, and that rule is stricter in one place: it rejects bytes from 0x7F
-// up in the extension, so a name passing IsValid83Char byte by byte can still
-// fail ValidShortName.
+// question, which also asks where spaces fall.
 func IsValid83Char(b byte) bool {
 	return isValid83Char(b, false)
 }

@@ -191,10 +191,29 @@
 // FragmentResult does with a chain it could only partly follow. Set
 // StopOnReadError to fail instead.
 //
-// That skipping is not otherwise observable: this package has no warning sink,
-// so a walk that stepped over an unreadable directory returns the same nil a
-// clean one does. To find out why a directory reported no children, call
-// OpenEntry on it and then ReadDir, which returns the underlying error.
+// Five kinds of directory are reported without being descended into: one that
+// cannot be read, one sitting on MaxDepth, one whose first cluster has already
+// been walked - a cycle or a cross-link - one whose first cluster is not a
+// data-area cluster at all, and a deleted one whose surviving data the
+// stale-copy guard refused. Set OnSkip to hear about each, with its SkipReason
+// and, for a failed read, the error:
+//
+//	err := v.WalkWithOptions(ctx, libfat.WalkOptions{
+//		OnSkip: func(path string, e libfat.DirEntry, reason libfat.SkipReason, err error) error {
+//			fmt.Println(path, reason, err)
+//			return nil
+//		},
+//	}, fn)
+//
+// Without it the skipping is not otherwise observable: this package has no
+// warning sink, so a walk that stepped over an unreadable directory returns the
+// same nil a clean one does, and a skipped directory looks exactly like an
+// empty one. To find out why a directory reported no children, call OpenEntry
+// on it and then ReadDir, which returns the underlying error. With
+// IncludeOrphans, OnOrphanScan reports what the orphan scan itself could not
+// cover: OrphanScanResult.Truncated for a bound that stopped the sweep, and
+// ReachableWalkFailed for a live subtree the reachability pre-pass could not
+// walk, which can make a reported orphan reachable after all.
 //
 // # Absolute directory entry offsets
 //
@@ -396,7 +415,9 @@
 //     subdirectory, with "." naming the directory itself and ".." its parent -
 //     0 when the parent is the root, as the specification requires and as
 //     Windows and Linux write even on FAT32 - and neither anywhere else nor in
-//     the root; names equal under case folding, long or short;
+//     the root (a directory opened through one of its own "." or ".." records
+//     has no known parent, and its ".." is not checked); names equal under
+//     case folding, long or short;
 //     live records after the end-of-directory marker; records that do not
 //     parse; a first cluster outside the data area; and a FAT mirror
 //     disagreement on any entry's first cluster. Reading a directory's own
@@ -423,7 +444,8 @@
 // is why the checks are separate passes rather than branches in the parser.
 // Walk inherits the checks through ReadDir, but skips a directory that fails
 // one as it skips any unreadable directory; set WalkOptions.StopOnReadError to
-// surface the error.
+// surface the error, or WalkOptions.OnSkip to receive each such directory as a
+// SkipReadError carrying the *StrictError, without aborting the walk.
 //
 // # Codecs for writers
 //

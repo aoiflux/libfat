@@ -71,7 +71,8 @@ const (
 	// StrictDotEntries: a subdirectory does not begin with "." pointing at
 	// itself and then ".." pointing at its parent (0 when the parent is the
 	// root, on every FAT type), or a "." or ".." record appears anywhere else,
-	// including anywhere in the root.
+	// including anywhere in the root. A directory opened through one of its
+	// own "." or ".." records has no known parent, so its ".." is not checked.
 	StrictDotEntries StrictCheck = "dot-entries"
 	// StrictDuplicateName: two live entries in one directory have names, long
 	// or short, that are equal under case folding.
